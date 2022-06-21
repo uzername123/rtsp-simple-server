@@ -264,6 +264,9 @@ func (a *api) mwLog(ctx *gin.Context) {
 
 	ctx.Writer.Header().Set("Server", "rtsp-simple-server")
 
+	ctx.Writer.Header().Set("Access-Control-Allow-Origin", "*" )
+	ctx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+
 	ctx.Next()
 
 	a.log(logger.Debug, "[conn %v] [s->c] %s", ctx.Request.RemoteAddr, logw.dump())
