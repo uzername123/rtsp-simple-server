@@ -12,6 +12,7 @@ import (
 	gopath "path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -27,7 +28,8 @@ func (nilWriter) Write(p []byte) (int, error) {
 }
 
 type hlsServerAPIMuxersListItem struct {
-	LastRequest string `json:"lastRequest"`
+	Created     time.Time `json:"created"`
+	LastRequest time.Time `json:"lastRequest"`
 }
 
 type hlsServerAPIMuxersListData struct {
@@ -62,6 +64,7 @@ type hlsServer struct {
 	hlsPartDuration           conf.StringDuration
 	hlsSegmentMaxSize         conf.StringSize
 	hlsAllowOrigin            string
+	hlsTrustedProxies         conf.IPsOrCIDRs
 	readBufferCount           int
 	pathManager               *pathManager
 	metrics                   *metrics
@@ -75,10 +78,11 @@ type hlsServer struct {
 	muxers    map[string]*hlsMuxer
 
 	// in
-	pathSourceReady chan *path
-	request         chan hlsMuxerRequest
-	muxerClose      chan *hlsMuxer
-	apiMuxersList   chan hlsServerAPIMuxersListReq
+	chPathSourceReady    chan *path
+	chPathSourceNotReady chan *path
+	request              chan *hlsMuxerRequest
+	chMuxerClose         chan *hlsMuxer
+	chAPIMuxerList       chan hlsServerAPIMuxersListReq
 }
 
 func newHLSServer(
@@ -95,6 +99,7 @@ func newHLSServer(
 	hlsEncryption bool,
 	hlsServerKey string,
 	hlsServerCert string,
+	hlsTrustedProxies conf.IPsOrCIDRs,
 	readBufferCount int,
 	pathManager *pathManager,
 	metrics *metrics,
@@ -129,6 +134,7 @@ func newHLSServer(
 		hlsPartDuration:           hlsPartDuration,
 		hlsSegmentMaxSize:         hlsSegmentMaxSize,
 		hlsAllowOrigin:            hlsAllowOrigin,
+		hlsTrustedProxies:         hlsTrustedProxies,
 		readBufferCount:           readBufferCount,
 		pathManager:               pathManager,
 		parent:                    parent,
@@ -138,18 +144,19 @@ func newHLSServer(
 		ln:                        ln,
 		tlsConfig:                 tlsConfig,
 		muxers:                    make(map[string]*hlsMuxer),
-		pathSourceReady:           make(chan *path),
-		request:                   make(chan hlsMuxerRequest),
-		muxerClose:                make(chan *hlsMuxer),
-		apiMuxersList:             make(chan hlsServerAPIMuxersListReq),
+		chPathSourceReady:         make(chan *path),
+		chPathSourceNotReady:      make(chan *path),
+		request:                   make(chan *hlsMuxerRequest),
+		chMuxerClose:              make(chan *hlsMuxer),
+		chAPIMuxerList:            make(chan hlsServerAPIMuxersListReq),
 	}
 
 	s.log(logger.Info, "listener opened on "+address)
 
-	s.pathManager.onHLSServerSet(s)
+	s.pathManager.hlsServerSet(s)
 
 	if s.metrics != nil {
-		s.metrics.onHLSServerSet(s)
+		s.metrics.hlsServerSet(s)
 	}
 
 	s.wg.Add(1)
@@ -175,6 +182,12 @@ func (s *hlsServer) run() {
 	router := gin.New()
 	router.NoRoute(s.onRequest)
 
+	tmp := make([]string, len(s.hlsTrustedProxies))
+	for i, entry := range s.hlsTrustedProxies {
+		tmp[i] = entry.String()
+	}
+	router.SetTrustedProxies(tmp)
+
 	hs := &http.Server{
 		Handler:   router,
 		TLSConfig: s.tlsConfig,
@@ -190,22 +203,34 @@ func (s *hlsServer) run() {
 outer:
 	for {
 		select {
-		case pa := <-s.pathSourceReady:
+		case pa := <-s.chPathSourceReady:
 			if s.hlsAlwaysRemux {
-				s.findOrCreateMuxer(pa.Name(), "")
+				s.findOrCreateMuxer(pa.Name(), "", nil)
+			}
+
+		case pa := <-s.chPathSourceNotReady:
+			if s.hlsAlwaysRemux {
+				c, ok := s.muxers[pa.Name()]
+				if ok {
+					c.close()
+					delete(s.muxers, pa.Name())
+				}
 			}
 
 		case req := <-s.request:
-			r := s.findOrCreateMuxer(req.dir, req.ctx.Request.RemoteAddr)
-			r.onRequest(req)
+			s.findOrCreateMuxer(req.dir, req.ctx.ClientIP(), req)
 
-		case c := <-s.muxerClose:
+		case c := <-s.chMuxerClose:
 			if c2, ok := s.muxers[c.PathName()]; !ok || c2 != c {
 				continue
 			}
 			delete(s.muxers, c.PathName())
 
-		case req := <-s.apiMuxersList:
+			if s.hlsAlwaysRemux && c.remoteAddr == "" {
+				s.findOrCreateMuxer(c.PathName(), "", nil)
+			}
+
+		case req := <-s.chAPIMuxerList:
 			muxers := make(map[string]*hlsMuxer)
 
 			for name, m := range s.muxers {
@@ -224,19 +249,20 @@ outer:
 	s.ctxCancel()
 
 	hs.Shutdown(context.Background())
+	s.ln.Close() // in case Shutdown() is called before Serve()
 
-	s.pathManager.onHLSServerSet(nil)
+	s.pathManager.hlsServerSet(nil)
 
 	if s.metrics != nil {
-		s.metrics.onHLSServerSet(nil)
+		s.metrics.hlsServerSet(nil)
 	}
 }
 
 func (s *hlsServer) onRequest(ctx *gin.Context) {
-	s.log(logger.Debug, "[conn %v] %s %s", ctx.Request.RemoteAddr, ctx.Request.Method, ctx.Request.URL.Path)
+	s.log(logger.Debug, "[conn %v] %s %s", ctx.ClientIP(), ctx.Request.Method, ctx.Request.URL.Path)
 
 	byts, _ := httputil.DumpRequest(ctx.Request, true)
-	s.log(logger.Debug, "[conn %v] [c->s] %s", ctx.Request.RemoteAddr, string(byts))
+	s.log(logger.Debug, "[conn %v] [c->s] %s", ctx.ClientIP(), string(byts))
 
 	logw := &httpLogWriter{ResponseWriter: ctx.Writer}
 	ctx.Writer = logw
@@ -286,7 +312,7 @@ func (s *hlsServer) onRequest(ctx *gin.Context) {
 	dir = strings.TrimSuffix(dir, "/")
 
 	cres := make(chan func() *hls.MuxerFileResponse)
-	hreq := hlsMuxerRequest{
+	hreq := &hlsMuxerRequest{
 		dir:  dir,
 		file: fname,
 		ctx:  ctx,
@@ -312,10 +338,10 @@ func (s *hlsServer) onRequest(ctx *gin.Context) {
 	case <-s.ctx.Done():
 	}
 
-	s.log(logger.Debug, "[conn %v] [s->c] %s", ctx.Request.RemoteAddr, logw.dump())
+	s.log(logger.Debug, "[conn %v] [s->c] %s", ctx.ClientIP(), logw.dump())
 }
 
-func (s *hlsServer) findOrCreateMuxer(pathName string, remoteAddr string) *hlsMuxer {
+func (s *hlsServer) findOrCreateMuxer(pathName string, remoteAddr string, req *hlsMuxerRequest) *hlsMuxer {
 	r, ok := s.muxers[pathName]
 	if !ok {
 		r = newHLSMuxer(
@@ -323,43 +349,53 @@ func (s *hlsServer) findOrCreateMuxer(pathName string, remoteAddr string) *hlsMu
 			pathName,
 			remoteAddr,
 			s.externalAuthenticationURL,
-			s.hlsAlwaysRemux,
 			s.hlsVariant,
 			s.hlsSegmentCount,
 			s.hlsSegmentDuration,
 			s.hlsPartDuration,
 			s.hlsSegmentMaxSize,
 			s.readBufferCount,
+			req,
 			&s.wg,
 			pathName,
 			s.pathManager,
 			s)
 		s.muxers[pathName] = r
+	} else if req != nil {
+		r.request(req)
 	}
 	return r
 }
 
-// onMuxerClose is called by hlsMuxer.
-func (s *hlsServer) onMuxerClose(c *hlsMuxer) {
+// muxerClose is called by hlsMuxer.
+func (s *hlsServer) muxerClose(c *hlsMuxer) {
 	select {
-	case s.muxerClose <- c:
+	case s.chMuxerClose <- c:
 	case <-s.ctx.Done():
 	}
 }
 
-// onPathSourceReady is called by core.
-func (s *hlsServer) onPathSourceReady(pa *path) {
+// pathSourceReady is called by pathManager.
+func (s *hlsServer) pathSourceReady(pa *path) {
 	select {
-	case s.pathSourceReady <- pa:
+	case s.chPathSourceReady <- pa:
 	case <-s.ctx.Done():
 	}
 }
 
-// onAPIHLSMuxersList is called by api.
-func (s *hlsServer) onAPIHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerAPIMuxersListRes {
+// pathSourceNotReady is called by pathManager.
+func (s *hlsServer) pathSourceNotReady(pa *path) {
+	select {
+	case s.chPathSourceNotReady <- pa:
+	case <-s.ctx.Done():
+	}
+}
+
+// apiHLSMuxersList is called by api.
+func (s *hlsServer) apiHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerAPIMuxersListRes {
 	req.res = make(chan hlsServerAPIMuxersListRes)
 	select {
-	case s.apiMuxersList <- req:
+	case s.chAPIMuxerList <- req:
 		res := <-req.res
 
 		res.data = &hlsServerAPIMuxersListData{
@@ -367,7 +403,7 @@ func (s *hlsServer) onAPIHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerA
 		}
 
 		for _, pa := range res.muxers {
-			pa.onAPIHLSMuxersList(hlsServerAPIMuxersListSubReq{data: res.data})
+			pa.apiHLSMuxersList(hlsServerAPIMuxersListSubReq{data: res.data})
 		}
 
 		return res

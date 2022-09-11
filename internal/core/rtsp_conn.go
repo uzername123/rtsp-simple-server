@@ -104,10 +104,10 @@ func (c *rtspConn) ip() net.IP {
 
 func (c *rtspConn) authenticate(
 	pathName string,
-	pathIPs []interface{},
+	pathIPs []fmt.Stringer,
 	pathUser conf.Credential,
 	pathPass conf.Credential,
-	action string,
+	isPublishing bool,
 	req *base.Request,
 	query string,
 ) error {
@@ -116,7 +116,7 @@ func (c *rtspConn) authenticate(
 		password := ""
 
 		var auth headers.Authorization
-		err := auth.Read(req.Header["Authorization"])
+		err := auth.Unmarshal(req.Header["Authorization"])
 		if err == nil && auth.Method == headers.AuthBasic {
 			username = auth.BasicUser
 			password = auth.BasicPass
@@ -128,7 +128,7 @@ func (c *rtspConn) authenticate(
 			username,
 			password,
 			pathName,
-			action,
+			isPublishing,
 			query)
 		if err != nil {
 			c.authFailures++
@@ -157,7 +157,7 @@ func (c *rtspConn) authenticate(
 						"WWW-Authenticate": headers.Authenticate{
 							Method: headers.AuthBasic,
 							Realm:  &v,
-						}.Write(),
+						}.Marshal(),
 					},
 				},
 			}
@@ -243,15 +243,15 @@ func (c *rtspConn) OnResponse(res *base.Response) {
 // onDescribe is called by rtspServer.
 func (c *rtspConn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
-	res := c.pathManager.onDescribe(pathDescribeReq{
+	res := c.pathManager.describe(pathDescribeReq{
 		pathName: ctx.Path,
 		url:      ctx.Request.URL,
 		authenticate: func(
-			pathIPs []interface{},
+			pathIPs []fmt.Stringer,
 			pathUser conf.Credential,
 			pathPass conf.Credential,
 		) error {
-			return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, "read", ctx.Request, ctx.Query)
+			return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, false, ctx.Request, ctx.Query)
 		},
 	})
 

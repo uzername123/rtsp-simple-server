@@ -15,6 +15,7 @@ import (
 	"github.com/aler9/gortsplib"
 	"github.com/aler9/gortsplib/pkg/base"
 	"github.com/aler9/gortsplib/pkg/headers"
+	"github.com/aler9/gortsplib/pkg/url"
 	"github.com/stretchr/testify/require"
 )
 
@@ -118,12 +119,6 @@ func (c *container) wait() int {
 	return int(code)
 }
 
-func (c *container) ip() string {
-	out, _ := exec.Command("docker", "inspect", "rtsp-simple-server-test-"+c.name,
-		"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}").Output()
-	return string(out[:len(out)-1])
-}
-
 func writeTempFile(byts []byte) (string, error) {
 	tmpf, err := ioutil.TempFile(os.TempDir(), "rtsp-")
 	if err != nil {
@@ -168,7 +163,7 @@ func TestCorePathAutoDeletion(t *testing.T) {
 				br := bufio.NewReader(conn)
 
 				if ca == "describe" {
-					u, err := base.ParseURL("rtsp://localhost:8554/mypath")
+					u, err := url.Parse("rtsp://localhost:8554/mypath")
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -177,7 +172,7 @@ func TestCorePathAutoDeletion(t *testing.T) {
 						Header: base.Header{
 							"CSeq": base.HeaderValue{"1"},
 						},
-					}.Write()
+					}.Marshal()
 					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
@@ -186,7 +181,7 @@ func TestCorePathAutoDeletion(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, base.StatusNotFound, res.StatusCode)
 				} else {
-					u, err := base.ParseURL("rtsp://localhost:8554/mypath/trackID=0")
+					u, err := url.Parse("rtsp://localhost:8554/mypath/trackID=0")
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -205,9 +200,9 @@ func TestCorePathAutoDeletion(t *testing.T) {
 								}(),
 								Protocol:    headers.TransportProtocolUDP,
 								ClientPorts: &[2]int{35466, 35467},
-							}.Write(),
+							}.Marshal(),
 						},
-					}.Write()
+					}.Marshal()
 					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
@@ -218,7 +213,7 @@ func TestCorePathAutoDeletion(t *testing.T) {
 				}
 			}()
 
-			res := p.pathManager.onAPIPathsList(pathAPIPathsListReq{})
+			res := p.pathManager.apiPathsList(pathAPIPathsListReq{})
 			require.NoError(t, res.err)
 
 			require.Equal(t, 0, len(res.data.Items))
@@ -246,15 +241,15 @@ func main() {
 		panic("environment not set")
 	}
 
-	track, err := gortsplib.NewTrackH264(96,
-		[]byte{0x01, 0x02, 0x03, 0x04}, []byte{0x01, 0x02, 0x03, 0x04}, nil)
-	if err != nil {
-		panic(err)
+	track := &gortsplib.TrackH264{
+		PayloadType: 96,
+		SPS: []byte{0x01, 0x02, 0x03, 0x04},
+		PPS: []byte{0x01, 0x02, 0x03, 0x04},
 	}
 
 	source := gortsplib.Client{}
 
-	err = source.StartPublishing(
+	err := source.StartPublishing(
 		"rtsp://localhost:" + os.Getenv("RTSP_PORT") + "/" + os.Getenv("RTSP_PATH"),
 		gortsplib.Tracks{track})
 	if err != nil {
@@ -304,7 +299,7 @@ func main() {
 				br := bufio.NewReader(conn)
 
 				if ca == "describe" || ca == "describe and setup" {
-					u, err := base.ParseURL("rtsp://localhost:8554/ondemand")
+					u, err := url.Parse("rtsp://localhost:8554/ondemand")
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -313,7 +308,7 @@ func main() {
 						Header: base.Header{
 							"CSeq": base.HeaderValue{"1"},
 						},
-					}.Write()
+					}.Marshal()
 					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
@@ -324,7 +319,7 @@ func main() {
 				}
 
 				if ca == "setup" || ca == "describe and setup" {
-					u, err := base.ParseURL("rtsp://localhost:8554/ondemand/trackID=0")
+					u, err := url.Parse("rtsp://localhost:8554/ondemand/trackID=0")
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -339,9 +334,9 @@ func main() {
 								}(),
 								Protocol:       headers.TransportProtocolTCP,
 								InterleavedIDs: &[2]int{0, 1},
-							}.Write(),
+							}.Marshal(),
 						},
-					}.Write()
+					}.Marshal()
 					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
@@ -375,13 +370,16 @@ func TestCorePathRunOnReady(t *testing.T) {
 		doneFile))
 	require.Equal(t, true, ok)
 	defer p.close()
-	track, err := gortsplib.NewTrackH264(96,
-		[]byte{0x01, 0x02, 0x03, 0x04}, []byte{0x01, 0x02, 0x03, 0x04}, nil)
-	require.NoError(t, err)
+
+	track := &gortsplib.TrackH264{
+		PayloadType: 96,
+		SPS:         []byte{0x01, 0x02, 0x03, 0x04},
+		PPS:         []byte{0x01, 0x02, 0x03, 0x04},
+	}
 
 	c := gortsplib.Client{}
 
-	err = c.StartPublishing(
+	err := c.StartPublishing(
 		"rtsp://localhost:8554/test",
 		gortsplib.Tracks{track})
 	require.NoError(t, err)
@@ -409,9 +407,11 @@ func TestCoreHotReloading(t *testing.T) {
 	defer p.close()
 
 	func() {
-		track, err := gortsplib.NewTrackH264(96,
-			[]byte{0x01, 0x02, 0x03, 0x04}, []byte{0x01, 0x02, 0x03, 0x04}, nil)
-		require.NoError(t, err)
+		track := &gortsplib.TrackH264{
+			PayloadType: 96,
+			SPS:         []byte{0x01, 0x02, 0x03, 0x04},
+			PPS:         []byte{0x01, 0x02, 0x03, 0x04},
+		}
 
 		c := gortsplib.Client{}
 
@@ -429,9 +429,11 @@ func TestCoreHotReloading(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	func() {
-		track, err := gortsplib.NewTrackH264(96,
-			[]byte{0x01, 0x02, 0x03, 0x04}, []byte{0x01, 0x02, 0x03, 0x04}, nil)
-		require.NoError(t, err)
+		track := &gortsplib.TrackH264{
+			PayloadType: 96,
+			SPS:         []byte{0x01, 0x02, 0x03, 0x04},
+			PPS:         []byte{0x01, 0x02, 0x03, 0x04},
+		}
 
 		conn := gortsplib.Client{}
 

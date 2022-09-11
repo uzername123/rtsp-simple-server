@@ -7,24 +7,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aler9/gortsplib"
 	"github.com/aler9/gortsplib/pkg/base"
 
+	"github.com/aler9/gortsplib/pkg/url"
 	"github.com/aler9/rtsp-simple-server/internal/conf"
 	"github.com/aler9/rtsp-simple-server/internal/logger"
 )
 
-const (
-	rtspSourceRetryPause = 5 * time.Second
-)
-
 type rtspSourceParent interface {
 	log(logger.Level, string, ...interface{})
-	onSourceStaticSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	onSourceStaticSetNotReady(req pathSourceStaticSetNotReadyReq)
+	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type rtspSource struct {
@@ -35,15 +31,10 @@ type rtspSource struct {
 	readTimeout     conf.StringDuration
 	writeTimeout    conf.StringDuration
 	readBufferCount int
-	wg              *sync.WaitGroup
 	parent          rtspSourceParent
-
-	ctx       context.Context
-	ctxCancel func()
 }
 
 func newRTSPSource(
-	parentCtx context.Context,
 	ur string,
 	proto conf.SourceProtocol,
 	anyPortEnable bool,
@@ -51,12 +42,9 @@ func newRTSPSource(
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
 	readBufferCount int,
-	wg *sync.WaitGroup,
 	parent rtspSourceParent,
 ) *rtspSource {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
-
-	s := &rtspSource{
+	return &rtspSource{
 		ur:              ur,
 		proto:           proto,
 		anyPortEnable:   anyPortEnable,
@@ -64,59 +52,19 @@ func newRTSPSource(
 		readTimeout:     readTimeout,
 		writeTimeout:    writeTimeout,
 		readBufferCount: readBufferCount,
-		wg:              wg,
 		parent:          parent,
-		ctx:             ctx,
-		ctxCancel:       ctxCancel,
 	}
-
-	s.log(logger.Info, "started")
-
-	s.wg.Add(1)
-	go s.run()
-
-	return s
 }
 
-func (s *rtspSource) close() {
-	s.log(logger.Info, "stopped")
-	s.ctxCancel()
-}
-
-func (s *rtspSource) log(level logger.Level, format string, args ...interface{}) {
+func (s *rtspSource) Log(level logger.Level, format string, args ...interface{}) {
 	s.parent.log(level, "[rtsp source] "+format, args...)
 }
 
-func (s *rtspSource) run() {
-	defer s.wg.Done()
-
-	for {
-		ok := func() bool {
-			ok := s.runInner()
-			if !ok {
-				return false
-			}
-
-			select {
-			case <-time.After(rtspSourceRetryPause):
-				return true
-			case <-s.ctx.Done():
-				return false
-			}
-		}()
-		if !ok {
-			break
-		}
-	}
-
-	s.ctxCancel()
-}
-
-func (s *rtspSource) runInner() bool {
-	s.log(logger.Debug, "connecting")
+// run implements sourceStaticImpl.
+func (s *rtspSource) run(ctx context.Context) error {
+	s.Log(logger.Debug, "connecting")
 
 	var tlsConfig *tls.Config
-
 	if s.fingerprint != "" {
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: true,
@@ -144,23 +92,21 @@ func (s *rtspSource) runInner() bool {
 		ReadBufferCount: s.readBufferCount,
 		AnyPortEnable:   s.anyPortEnable,
 		OnRequest: func(req *base.Request) {
-			s.log(logger.Debug, "c->s %v", req)
+			s.Log(logger.Debug, "c->s %v", req)
 		},
 		OnResponse: func(res *base.Response) {
-			s.log(logger.Debug, "s->c %v", res)
+			s.Log(logger.Debug, "s->c %v", res)
 		},
 	}
 
-	u, err := base.ParseURL(s.ur)
+	u, err := url.Parse(s.ur)
 	if err != nil {
-		s.log(logger.Info, "ERR: %s", err)
-		return true
+		return err
 	}
 
 	err = c.Start(u.Scheme, u.Host)
 	if err != nil {
-		s.log(logger.Info, "ERR: %s", err)
-		return true
+		return err
 	}
 	defer c.Close()
 
@@ -179,33 +125,33 @@ func (s *rtspSource) runInner() bool {
 				}
 			}
 
-			res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
-				source: s,
-				tracks: c.Tracks(),
+			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
+				tracks:             tracks,
+				generateRTPPackets: false,
 			})
 			if res.err != nil {
 				return res.err
 			}
 
-			s.log(logger.Info, "ready")
+			s.Log(logger.Info, "ready: %s", sourceTrackInfo(tracks))
 
 			defer func() {
-				s.parent.onSourceStaticSetNotReady(pathSourceStaticSetNotReadyReq{source: s})
+				s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
 			}()
 
 			c.OnPacketRTP = func(ctx *gortsplib.ClientOnPacketRTPCtx) {
 				if ctx.H264NALUs != nil {
 					res.stream.writeData(&data{
 						trackID:      ctx.TrackID,
-						rtp:          ctx.Packet,
+						rtpPacket:    ctx.Packet,
 						ptsEqualsDTS: ctx.PTSEqualsDTS,
-						h264NALUs:    append([][]byte(nil), ctx.H264NALUs...),
-						h264PTS:      ctx.H264PTS,
+						pts:          ctx.H264PTS,
+						h264NALUs:    ctx.H264NALUs,
 					})
 				} else {
 					res.stream.writeData(&data{
 						trackID:      ctx.TrackID,
-						rtp:          ctx.Packet,
+						rtpPacket:    ctx.Packet,
 						ptsEqualsDTS: ctx.PTSEqualsDTS,
 					})
 				}
@@ -222,18 +168,17 @@ func (s *rtspSource) runInner() bool {
 
 	select {
 	case err := <-readErr:
-		s.log(logger.Info, "ERR: %s", err)
-		return true
+		return err
 
-	case <-s.ctx.Done():
+	case <-ctx.Done():
 		c.Close()
 		<-readErr
-		return false
+		return nil
 	}
 }
 
-// onSourceAPIDescribe implements source.
-func (*rtspSource) onSourceAPIDescribe() interface{} {
+// apiSourceDescribe implements sourceStaticImpl.
+func (*rtspSource) apiSourceDescribe() interface{} {
 	return struct {
 		Type string `json:"type"`
 	}{"rtspSource"}

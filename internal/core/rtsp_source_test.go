@@ -10,6 +10,7 @@ import (
 	"github.com/aler9/gortsplib/pkg/auth"
 	"github.com/aler9/gortsplib/pkg/base"
 	"github.com/aler9/gortsplib/pkg/rtph264"
+	"github.com/aler9/gortsplib/pkg/url"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -40,8 +41,14 @@ func TestRTSPSource(t *testing.T) {
 		"tls",
 	} {
 		t.Run(source, func(t *testing.T) {
-			track, _ := gortsplib.NewTrackH264(96, []byte{0x01, 0x02, 0x03, 0x04}, []byte{0x05, 0x06}, nil)
+			track := &gortsplib.TrackH264{
+				PayloadType: 96,
+				SPS:         []byte{0x01, 0x02, 0x03, 0x04},
+				PPS:         []byte{0x01, 0x02, 0x03, 0x04},
+			}
+
 			stream := gortsplib.NewServerStream(gortsplib.Tracks{track})
+
 			var authValidator *auth.Validator
 
 			s := gortsplib.Server{
@@ -138,8 +145,6 @@ func TestRTSPSource(t *testing.T) {
 				defer p.close()
 			}
 
-			time.Sleep(1 * time.Second)
-
 			received := make(chan struct{})
 
 			c := gortsplib.Client{
@@ -149,9 +154,18 @@ func TestRTSPSource(t *testing.T) {
 				},
 			}
 
-			err = c.StartReading("rtsp://127.0.0.1:8554/proxied")
+			u, err := url.Parse("rtsp://127.0.0.1:8554/proxied")
+			require.NoError(t, err)
+
+			err = c.Start(u.Scheme, u.Host)
 			require.NoError(t, err)
 			defer c.Close()
+
+			tracks, baseURL, _, err := c.Describe(u)
+			require.NoError(t, err)
+
+			err = c.SetupAndPlay(tracks, baseURL)
+			require.NoError(t, err)
 
 			<-received
 		})
@@ -159,8 +173,14 @@ func TestRTSPSource(t *testing.T) {
 }
 
 func TestRTSPSourceNoPassword(t *testing.T) {
-	track, _ := gortsplib.NewTrackH264(96, []byte{0x01, 0x02, 0x03, 0x04}, []byte{0x05, 0x06}, nil)
+	track := &gortsplib.TrackH264{
+		PayloadType: 96,
+		SPS:         []byte{0x01, 0x02, 0x03, 0x04},
+		PPS:         []byte{0x01, 0x02, 0x03, 0x04},
+	}
+
 	stream := gortsplib.NewServerStream(gortsplib.Tracks{track})
+
 	var authValidator *auth.Validator
 	done := make(chan struct{})
 
@@ -217,8 +237,9 @@ func TestRTSPSourceNoPassword(t *testing.T) {
 }
 
 func TestRTSPSourceDynamicH264Params(t *testing.T) {
-	track, err := gortsplib.NewTrackH264(96, nil, nil, nil)
-	require.NoError(t, err)
+	track := &gortsplib.TrackH264{
+		PayloadType: 96,
+	}
 
 	stream := gortsplib.NewServerStream(gortsplib.Tracks{track})
 	defer stream.Close()
@@ -243,7 +264,7 @@ func TestRTSPSourceDynamicH264Params(t *testing.T) {
 		},
 		RTSPAddress: "127.0.0.1:8555",
 	}
-	err = s.Start()
+	err := s.Start()
 	require.NoError(t, err)
 	defer s.Wait()
 	defer s.Close()
@@ -274,7 +295,7 @@ func TestRTSPSourceDynamicH264Params(t *testing.T) {
 	func() {
 		c := gortsplib.Client{}
 
-		u, err := base.ParseURL("rtsp://127.0.0.1:8554/proxied")
+		u, err := url.Parse("rtsp://127.0.0.1:8554/proxied")
 		require.NoError(t, err)
 
 		err = c.Start(u.Scheme, u.Host)
@@ -286,8 +307,8 @@ func TestRTSPSourceDynamicH264Params(t *testing.T) {
 
 		h264Track, ok := tracks[0].(*gortsplib.TrackH264)
 		require.Equal(t, true, ok)
-		require.Equal(t, []byte{7, 1, 2, 3}, h264Track.SPS())
-		require.Equal(t, []byte{8}, h264Track.PPS())
+		require.Equal(t, []byte{7, 1, 2, 3}, h264Track.SafeSPS())
+		require.Equal(t, []byte{8}, h264Track.SafePPS())
 	}()
 
 	pkts, err = enc.Encode([][]byte{{7, 4, 5, 6}}, 0) // SPS
@@ -303,7 +324,7 @@ func TestRTSPSourceDynamicH264Params(t *testing.T) {
 	func() {
 		c := gortsplib.Client{}
 
-		u, err := base.ParseURL("rtsp://127.0.0.1:8554/proxied")
+		u, err := url.Parse("rtsp://127.0.0.1:8554/proxied")
 		require.NoError(t, err)
 
 		err = c.Start(u.Scheme, u.Host)
@@ -315,7 +336,7 @@ func TestRTSPSourceDynamicH264Params(t *testing.T) {
 
 		h264Track, ok := tracks[0].(*gortsplib.TrackH264)
 		require.Equal(t, true, ok)
-		require.Equal(t, []byte{7, 4, 5, 6}, h264Track.SPS())
-		require.Equal(t, []byte{8, 1}, h264Track.PPS())
+		require.Equal(t, []byte{7, 4, 5, 6}, h264Track.SafeSPS())
+		require.Equal(t, []byte{8, 1}, h264Track.SafePPS())
 	}()
 }

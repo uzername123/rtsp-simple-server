@@ -45,12 +45,11 @@ func newClientVideoProcessor(
 }
 
 func (p *clientVideoProcessor) run() error {
-	track, err := gortsplib.NewTrackH264(96, nil, nil, nil)
-	if err != nil {
-		return err
+	track := &gortsplib.TrackH264{
+		PayloadType: 96,
 	}
 
-	err = p.onTrack(track)
+	err := p.onTrack(track)
 	if err != nil {
 		return err
 	}
@@ -83,9 +82,9 @@ func (p *clientVideoProcessor) doProcess(
 		}
 	}
 
-	nalus, err := h264.AnnexBDecode(data)
+	nalus, err := h264.AnnexBUnmarshal(data)
 	if err != nil {
-		p.logger.Log(logger.Warn, "unable to decode Annex-B: %s", err)
+		p.logger.Log(logger.Warn, "unable to unmarshal Annex-B: %s", err)
 		return nil
 	}
 

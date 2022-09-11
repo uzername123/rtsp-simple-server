@@ -12,8 +12,9 @@ import (
 	"time"
 
 	"github.com/aler9/gortsplib"
+	"github.com/aler9/gortsplib/pkg/mpeg4audio"
 	"github.com/aler9/gortsplib/pkg/ringbuffer"
-	"github.com/aler9/gortsplib/pkg/rtpaac"
+	"github.com/aler9/gortsplib/pkg/rtpmpeg4audio"
 	"github.com/gin-gonic/gin"
 
 	"github.com/aler9/rtsp-simple-server/internal/conf"
@@ -56,9 +57,10 @@ const create = () => {
 
 	// always prefer hls.js over native HLS.
 	// this is because some Android versions support native HLS
-	// but doesn't support fMP4s.
+	// but don't support fMP4s.
 	if (Hls.isSupported()) {
 		const hls = new Hls({
+			maxLiveSyncPlaybackRate: 1.5,
 		});
 
 		hls.on(Hls.Events.ERROR, (evt, data) => {
@@ -101,18 +103,18 @@ type hlsMuxerRequest struct {
 }
 
 type hlsMuxerPathManager interface {
-	onReaderSetupPlay(req pathReaderSetupPlayReq) pathReaderSetupPlayRes
+	readerAdd(req pathReaderAddReq) pathReaderSetupPlayRes
 }
 
 type hlsMuxerParent interface {
 	log(logger.Level, string, ...interface{})
-	onMuxerClose(*hlsMuxer)
+	muxerClose(*hlsMuxer)
 }
 
 type hlsMuxer struct {
 	name                      string
+	remoteAddr                string
 	externalAuthenticationURL string
-	hlsAlwaysRemux            bool
 	hlsVariant                conf.HLSVariant
 	hlsSegmentCount           int
 	hlsSegmentDuration        conf.StringDuration
@@ -126,15 +128,16 @@ type hlsMuxer struct {
 
 	ctx             context.Context
 	ctxCancel       func()
+	created         time.Time
 	path            *path
 	ringBuffer      *ringbuffer.RingBuffer
 	lastRequestTime *int64
 	muxer           *hls.Muxer
-	requests        []hlsMuxerRequest
+	requests        []*hlsMuxerRequest
 
 	// in
-	request                chan hlsMuxerRequest
-	hlsServerAPIMuxersList chan hlsServerAPIMuxersListSubReq
+	chRequest          chan *hlsMuxerRequest
+	chAPIHLSMuxersList chan hlsServerAPIMuxersListSubReq
 }
 
 func newHLSMuxer(
@@ -142,13 +145,13 @@ func newHLSMuxer(
 	name string,
 	remoteAddr string,
 	externalAuthenticationURL string,
-	hlsAlwaysRemux bool,
 	hlsVariant conf.HLSVariant,
 	hlsSegmentCount int,
 	hlsSegmentDuration conf.StringDuration,
 	hlsPartDuration conf.StringDuration,
 	hlsSegmentMaxSize conf.StringSize,
 	readBufferCount int,
+	req *hlsMuxerRequest,
 	wg *sync.WaitGroup,
 	pathName string,
 	pathManager hlsMuxerPathManager,
@@ -158,8 +161,8 @@ func newHLSMuxer(
 
 	m := &hlsMuxer{
 		name:                      name,
+		remoteAddr:                remoteAddr,
 		externalAuthenticationURL: externalAuthenticationURL,
-		hlsAlwaysRemux:            hlsAlwaysRemux,
 		hlsVariant:                hlsVariant,
 		hlsSegmentCount:           hlsSegmentCount,
 		hlsSegmentDuration:        hlsSegmentDuration,
@@ -172,12 +175,17 @@ func newHLSMuxer(
 		parent:                    parent,
 		ctx:                       ctx,
 		ctxCancel:                 ctxCancel,
+		created:                   time.Now(),
 		lastRequestTime: func() *int64 {
-			v := time.Now().Unix()
+			v := time.Now().UnixNano()
 			return &v
 		}(),
-		request:                make(chan hlsMuxerRequest),
-		hlsServerAPIMuxersList: make(chan hlsServerAPIMuxersListSubReq),
+		chRequest:          make(chan *hlsMuxerRequest),
+		chAPIHLSMuxersList: make(chan hlsServerAPIMuxersListSubReq),
+	}
+
+	if req != nil {
+		m.requests = append(m.requests, req)
 	}
 
 	m.log(logger.Info, "created %s", func() string {
@@ -226,16 +234,17 @@ func (m *hlsMuxer) run() {
 				<-innerErr
 				return errors.New("terminated")
 
-			case req := <-m.request:
+			case req := <-m.chRequest:
 				if isReady {
 					req.res <- m.handleRequest(req)
 				} else {
 					m.requests = append(m.requests, req)
 				}
 
-			case req := <-m.hlsServerAPIMuxersList:
+			case req := <-m.chAPIHLSMuxersList:
 				req.data.Items[m.name] = hlsServerAPIMuxersListItem{
-					LastRequest: time.Unix(atomic.LoadInt64(m.lastRequestTime), 0).String(),
+					Created:     m.created,
+					LastRequest: time.Unix(0, atomic.LoadInt64(m.lastRequestTime)),
 				}
 				close(req.res)
 
@@ -261,13 +270,13 @@ func (m *hlsMuxer) run() {
 		}
 	}
 
-	m.parent.onMuxerClose(m)
+	m.parent.muxerClose(m)
 
 	m.log(logger.Info, "destroyed (%v)", err)
 }
 
 func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) error {
-	res := m.pathManager.onReaderSetupPlay(pathReaderSetupPlayReq{
+	res := m.pathManager.readerAdd(pathReaderAddReq{
 		author:       m,
 		pathName:     m.pathName,
 		authenticate: nil,
@@ -279,14 +288,14 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 	m.path = res.path
 
 	defer func() {
-		m.path.onReaderRemove(pathReaderRemoveReq{author: m})
+		m.path.readerRemove(pathReaderRemoveReq{author: m})
 	}()
 
 	var videoTrack *gortsplib.TrackH264
 	videoTrackID := -1
-	var audioTrack *gortsplib.TrackAAC
+	var audioTrack *gortsplib.TrackMPEG4Audio
 	audioTrackID := -1
-	var aacDecoder *rtpaac.Decoder
+	var aacDecoder *rtpmpeg4audio.Decoder
 
 	for i, track := range res.stream.tracks() {
 		switch tt := track.(type) {
@@ -298,18 +307,18 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 			videoTrack = tt
 			videoTrackID = i
 
-		case *gortsplib.TrackAAC:
+		case *gortsplib.TrackMPEG4Audio:
 			if audioTrack != nil {
 				return fmt.Errorf("can't encode track %d with HLS: too many tracks", i+1)
 			}
 
 			audioTrack = tt
 			audioTrackID = i
-			aacDecoder = &rtpaac.Decoder{
-				SampleRate:       tt.ClockRate(),
-				SizeLength:       tt.SizeLength(),
-				IndexLength:      tt.IndexLength(),
-				IndexDeltaLength: tt.IndexDeltaLength(),
+			aacDecoder = &rtpmpeg4audio.Decoder{
+				SampleRate:       tt.Config.SampleRate,
+				SizeLength:       tt.SizeLength,
+				IndexLength:      tt.IndexLength,
+				IndexDeltaLength: tt.IndexDeltaLength,
 			}
 			aacDecoder.Init()
 		}
@@ -336,9 +345,12 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 
 	innerReady <- struct{}{}
 
-	m.ringBuffer = ringbuffer.New(uint64(m.readBufferCount))
+	m.ringBuffer, _ = ringbuffer.New(uint64(m.readBufferCount))
 
-	m.path.onReaderPlay(pathReaderPlayReq{author: m})
+	m.path.readerStart(pathReaderStartReq{author: m})
+
+	m.log(logger.Info, "is converting into HLS, %s",
+		sourceTrackInfo(res.stream.tracks()))
 
 	writerDone := make(chan error)
 	go func() {
@@ -358,27 +370,33 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 					}
 
 					if videoInitialPTS == nil {
-						v := data.h264PTS
+						v := data.pts
 						videoInitialPTS = &v
 					}
-					pts := data.h264PTS - *videoInitialPTS
+					pts := data.pts - *videoInitialPTS
 
-					err = m.muxer.WriteH264(pts, data.h264NALUs)
+					err = m.muxer.WriteH264(time.Now(), pts, data.h264NALUs)
 					if err != nil {
 						return fmt.Errorf("muxer error: %v", err)
 					}
 				} else if audioTrack != nil && data.trackID == audioTrackID {
-					aus, pts, err := aacDecoder.Decode(data.rtp)
+					aus, pts, err := aacDecoder.Decode(data.rtpPacket)
 					if err != nil {
-						if err != rtpaac.ErrMorePacketsNeeded {
+						if err != rtpmpeg4audio.ErrMorePacketsNeeded {
 							m.log(logger.Warn, "unable to decode audio track: %v", err)
 						}
 						continue
 					}
 
-					err = m.muxer.WriteAAC(pts, aus)
-					if err != nil {
-						return fmt.Errorf("muxer error: %v", err)
+					for i, au := range aus {
+						err = m.muxer.WriteAAC(
+							time.Now(),
+							pts+time.Duration(i)*mpeg4audio.SamplesPerAccessUnit*
+								time.Second/time.Duration(audioTrack.ClockRate()),
+							au)
+						if err != nil {
+							return fmt.Errorf("muxer error: %v", err)
+						}
 					}
 				}
 			}
@@ -391,8 +409,8 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 	for {
 		select {
 		case <-closeCheckTicker.C:
-			t := time.Unix(atomic.LoadInt64(m.lastRequestTime), 0)
-			if !m.hlsAlwaysRemux && time.Since(t) >= closeAfterInactivity {
+			t := time.Unix(0, atomic.LoadInt64(m.lastRequestTime))
+			if m.remoteAddr != "" && time.Since(t) >= closeAfterInactivity {
 				m.ringBuffer.Close()
 				<-writerDone
 				return fmt.Errorf("not used anymore")
@@ -409,10 +427,10 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 	}
 }
 
-func (m *hlsMuxer) handleRequest(req hlsMuxerRequest) func() *hls.MuxerFileResponse {
-	atomic.StoreInt64(m.lastRequestTime, time.Now().Unix())
+func (m *hlsMuxer) handleRequest(req *hlsMuxerRequest) func() *hls.MuxerFileResponse {
+	atomic.StoreInt64(m.lastRequestTime, time.Now().UnixNano())
 
-	err := m.authenticate(req.ctx.Request)
+	err := m.authenticate(req.ctx)
 	if err != nil {
 		if terr, ok := err.(pathErrAuthCritical); ok {
 			m.log(logger.Info, "authentication error: %s", terr.message)
@@ -454,16 +472,15 @@ func (m *hlsMuxer) handleRequest(req hlsMuxerRequest) func() *hls.MuxerFileRespo
 	}
 }
 
-func (m *hlsMuxer) authenticate(req *http.Request) error {
+func (m *hlsMuxer) authenticate(ctx *gin.Context) error {
 	pathConf := m.path.Conf()
 	pathIPs := pathConf.ReadIPs
 	pathUser := pathConf.ReadUser
 	pathPass := pathConf.ReadPass
 
 	if m.externalAuthenticationURL != "" {
-		tmp, _, _ := net.SplitHostPort(req.RemoteAddr)
-		ip := net.ParseIP(tmp)
-		user, pass, _ := req.BasicAuth()
+		ip := net.ParseIP(ctx.ClientIP())
+		user, pass, ok := ctx.Request.BasicAuth()
 
 		err := externalAuth(
 			m.externalAuthenticationURL,
@@ -471,9 +488,13 @@ func (m *hlsMuxer) authenticate(req *http.Request) error {
 			user,
 			pass,
 			m.pathName,
-			"read",
-			req.URL.RawQuery)
+			false,
+			ctx.Request.URL.RawQuery)
 		if err != nil {
+			if !ok {
+				return pathErrAuthNotCritical{}
+			}
+
 			return pathErrAuthCritical{
 				message: fmt.Sprintf("external authentication failed: %s", err),
 			}
@@ -481,8 +502,7 @@ func (m *hlsMuxer) authenticate(req *http.Request) error {
 	}
 
 	if pathIPs != nil {
-		tmp, _, _ := net.SplitHostPort(req.RemoteAddr)
-		ip := net.ParseIP(tmp)
+		ip := net.ParseIP(ctx.ClientIP())
 
 		if !ipEqualOrInRange(ip, pathIPs) {
 			return pathErrAuthCritical{
@@ -492,7 +512,7 @@ func (m *hlsMuxer) authenticate(req *http.Request) error {
 	}
 
 	if pathUser != "" {
-		user, pass, ok := req.BasicAuth()
+		user, pass, ok := ctx.Request.BasicAuth()
 		if !ok {
 			return pathErrAuthNotCritical{}
 		}
@@ -507,10 +527,10 @@ func (m *hlsMuxer) authenticate(req *http.Request) error {
 	return nil
 }
 
-// onRequest is called by hlsserver.Server (forwarded from ServeHTTP).
-func (m *hlsMuxer) onRequest(req hlsMuxerRequest) {
+// request is called by hlsserver.Server (forwarded from ServeHTTP).
+func (m *hlsMuxer) request(req *hlsMuxerRequest) {
 	select {
-	case m.request <- req:
+	case m.chRequest <- req:
 	case <-m.ctx.Done():
 		req.res <- func() *hls.MuxerFileResponse {
 			return &hls.MuxerFileResponse{Status: http.StatusInternalServerError}
@@ -518,9 +538,15 @@ func (m *hlsMuxer) onRequest(req hlsMuxerRequest) {
 	}
 }
 
-// onReaderAccepted implements reader.
-func (m *hlsMuxer) onReaderAccepted() {
-	m.log(logger.Info, "is converting into HLS")
+// apiHLSMuxersList is called by api.
+func (m *hlsMuxer) apiHLSMuxersList(req hlsServerAPIMuxersListSubReq) {
+	req.res = make(chan struct{})
+	select {
+	case m.chAPIHLSMuxersList <- req:
+		<-req.res
+
+	case <-m.ctx.Done():
+	}
 }
 
 // onReaderData implements reader.
@@ -528,20 +554,9 @@ func (m *hlsMuxer) onReaderData(data *data) {
 	m.ringBuffer.Push(data)
 }
 
-// onReaderAPIDescribe implements reader.
-func (m *hlsMuxer) onReaderAPIDescribe() interface{} {
+// apiReaderDescribe implements reader.
+func (m *hlsMuxer) apiReaderDescribe() interface{} {
 	return struct {
 		Type string `json:"type"`
 	}{"hlsMuxer"}
-}
-
-// onAPIHLSMuxersList is called by api.
-func (m *hlsMuxer) onAPIHLSMuxersList(req hlsServerAPIMuxersListSubReq) {
-	req.res = make(chan struct{})
-	select {
-	case m.hlsServerAPIMuxersList <- req:
-		<-req.res
-
-	case <-m.ctx.Done():
-	}
 }

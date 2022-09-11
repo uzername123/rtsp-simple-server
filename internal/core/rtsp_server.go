@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"strconv"
 	"strings"
@@ -22,8 +21,9 @@ import (
 )
 
 type rtspServerAPISessionsListItem struct {
-	RemoteAddr string `json:"remoteAddr"`
-	State      string `json:"state"`
+	Created    time.Time `json:"created"`
+	RemoteAddr string    `json:"remoteAddr"`
+	State      string    `json:"state"`
 }
 
 type rtspServerAPISessionsListData struct {
@@ -47,6 +47,22 @@ type rtspServerAPISessionsKickReq struct {
 
 type rtspServerParent interface {
 	Log(logger.Level, string, ...interface{})
+}
+
+func printAddresses(srv *gortsplib.Server) string {
+	var ret []string
+
+	ret = append(ret, fmt.Sprintf("%s (TCP)", srv.RTSPAddress))
+
+	if srv.UDPRTPAddress != "" {
+		ret = append(ret, fmt.Sprintf("%s (UDP/RTP)", srv.UDPRTPAddress))
+	}
+
+	if srv.UDPRTCPAddress != "" {
+		ret = append(ret, fmt.Sprintf("%s (UDP/RTCP)", srv.UDPRTCPAddress))
+	}
+
+	return strings.Join(ret, ", ")
 }
 
 type rtspServer struct {
@@ -152,25 +168,13 @@ func newRTSPServer(
 		return nil, err
 	}
 
-	var temp []string
-
-	temp = append(temp, fmt.Sprintf("%s (TCP)", address))
-
-	if s.srv.UDPRTPAddress != "" {
-		temp = append(temp, fmt.Sprintf("%s (UDP/RTP)", s.srv.UDPRTPAddress))
-	}
-
-	if s.srv.UDPRTCPAddress != "" {
-		temp = append(temp, fmt.Sprintf("%s (UDP/RTCP)", s.srv.UDPRTCPAddress))
-	}
-
-	s.log(logger.Info, "listener opened on "+strings.Join(temp, ", "))
+	s.log(logger.Info, "listener opened on %s", printAddresses(s.srv))
 
 	if s.metrics != nil {
 		if !isTLS {
-			s.metrics.onRTSPServerSet(s)
+			s.metrics.rtspServerSet(s)
 		} else {
-			s.metrics.onRTSPSServerSet(s)
+			s.metrics.rtspsServerSet(s)
 		}
 	}
 
@@ -220,9 +224,9 @@ outer:
 
 	if s.metrics != nil {
 		if !s.isTLS {
-			s.metrics.onRTSPServerSet(nil)
+			s.metrics.rtspServerSet(nil)
 		} else {
-			s.metrics.onRTSPSServerSet(nil)
+			s.metrics.rtspsServerSet(nil)
 		}
 	}
 }
@@ -235,7 +239,7 @@ func (s *rtspServer) newSessionID() (string, error) {
 			return "", err
 		}
 
-		u := binary.LittleEndian.Uint32(b)
+		u := uint32(b[3])<<24 | uint32(b[2])<<16 | uint32(b[1])<<8 | uint32(b[0])
 		u %= 899999999
 		u += 100000000
 
@@ -243,7 +247,7 @@ func (s *rtspServer) newSessionID() (string, error) {
 
 		alreadyPresent := func() bool {
 			for _, s := range s.sessions {
-				if s.ID() == id {
+				if s.id == id {
 					return true
 				}
 			}
@@ -393,8 +397,8 @@ func (s *rtspServer) OnPacketRTP(ctx *gortsplib.ServerHandlerOnPacketRTPCtx) {
 	se.onPacketRTP(ctx)
 }
 
-// onAPISessionsList is called by api and metrics.
-func (s *rtspServer) onAPISessionsList(req rtspServerAPISessionsListReq) rtspServerAPISessionsListRes {
+// apiSessionsList is called by api and metrics.
+func (s *rtspServer) apiSessionsList(req rtspServerAPISessionsListReq) rtspServerAPISessionsListRes {
 	select {
 	case <-s.ctx.Done():
 		return rtspServerAPISessionsListRes{err: fmt.Errorf("terminated")}
@@ -409,8 +413,9 @@ func (s *rtspServer) onAPISessionsList(req rtspServerAPISessionsListReq) rtspSer
 	}
 
 	for _, s := range s.sessions {
-		data.Items[s.ID()] = rtspServerAPISessionsListItem{
-			RemoteAddr: s.RemoteAddr().String(),
+		data.Items[s.id] = rtspServerAPISessionsListItem{
+			Created:    s.created,
+			RemoteAddr: s.remoteAddr().String(),
 			State: func() string {
 				switch s.safeState() {
 				case gortsplib.ServerSessionStatePrePlay,
@@ -429,8 +434,8 @@ func (s *rtspServer) onAPISessionsList(req rtspServerAPISessionsListReq) rtspSer
 	return rtspServerAPISessionsListRes{data: data}
 }
 
-// onAPISessionsKick is called by api.
-func (s *rtspServer) onAPISessionsKick(req rtspServerAPISessionsKickReq) rtspServerAPISessionsKickRes {
+// apiSessionsKick is called by api.
+func (s *rtspServer) apiSessionsKick(req rtspServerAPISessionsKickReq) rtspServerAPISessionsKickRes {
 	select {
 	case <-s.ctx.Done():
 		return rtspServerAPISessionsKickRes{err: fmt.Errorf("terminated")}
@@ -441,7 +446,7 @@ func (s *rtspServer) onAPISessionsKick(req rtspServerAPISessionsKickReq) rtspSer
 	defer s.mutex.RUnlock()
 
 	for key, se := range s.sessions {
-		if se.ID() == req.id {
+		if se.id == req.id {
 			se.close()
 			delete(s.sessions, key)
 			se.onClose(liberrors.ErrServerTerminated{})

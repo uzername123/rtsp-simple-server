@@ -28,7 +28,7 @@ func NewMuxer(
 	partDuration time.Duration,
 	segmentMaxSize uint64,
 	videoTrack *gortsplib.TrackH264,
-	audioTrack *gortsplib.TrackAAC,
+	audioTrack *gortsplib.TrackMPEG4Audio,
 ) (*Muxer, error) {
 	m := &Muxer{}
 
@@ -76,13 +76,13 @@ func (m *Muxer) Close() {
 }
 
 // WriteH264 writes H264 NALUs, grouped by timestamp.
-func (m *Muxer) WriteH264(pts time.Duration, nalus [][]byte) error {
-	return m.variant.writeH264(pts, nalus)
+func (m *Muxer) WriteH264(now time.Time, pts time.Duration, nalus [][]byte) error {
+	return m.variant.writeH264(now, pts, nalus)
 }
 
 // WriteAAC writes AAC AUs, grouped by timestamp.
-func (m *Muxer) WriteAAC(pts time.Duration, aus [][]byte) error {
-	return m.variant.writeAAC(pts, aus)
+func (m *Muxer) WriteAAC(now time.Time, pts time.Duration, au []byte) error {
+	return m.variant.writeAAC(now, pts, au)
 }
 
 // File returns a file reader.

@@ -20,8 +20,8 @@ const (
 )
 
 type rtspSessionPathManager interface {
-	onPublisherAnnounce(req pathPublisherAnnounceReq) pathPublisherAnnounceRes
-	onReaderSetupPlay(req pathReaderSetupPlayReq) pathReaderSetupPlayRes
+	publisherAdd(req pathPublisherAddReq) pathPublisherAnnounceRes
+	readerAdd(req pathReaderAddReq) pathReaderSetupPlayRes
 }
 
 type rtspSessionParent interface {
@@ -38,12 +38,13 @@ type rtspSession struct {
 	pathManager     rtspSessionPathManager
 	parent          rtspSessionParent
 
+	created         time.Time
 	path            *path
+	stream          *stream
 	state           gortsplib.ServerSessionState
 	stateMutex      sync.Mutex
 	onReadCmd       *externalcmd.Cmd // read
 	announcedTracks gortsplib.Tracks // publish
-	stream          *stream          // publish
 }
 
 func newRTSPSession(
@@ -65,6 +66,7 @@ func newRTSPSession(
 		externalCmdPool: externalCmdPool,
 		pathManager:     pathManager,
 		parent:          parent,
+		created:         time.Now(),
 	}
 
 	s.log(logger.Info, "created by %v", s.author.NetConn().RemoteAddr())
@@ -77,13 +79,8 @@ func (s *rtspSession) close() {
 	s.ss.Close()
 }
 
-// IsRTSPSession implements pathRTSPSession.
-func (s *rtspSession) IsRTSPSession() {}
-
-// ID returns the public ID of the session.
-func (s *rtspSession) ID() string {
-	return s.id
-}
+// isRTSPSession implements pathRTSPSession.
+func (s *rtspSession) isRTSPSession() {}
 
 func (s *rtspSession) safeState() gortsplib.ServerSessionState {
 	s.stateMutex.Lock()
@@ -91,8 +88,7 @@ func (s *rtspSession) safeState() gortsplib.ServerSessionState {
 	return s.state
 }
 
-// RemoteAddr returns the remote address of the author of the session.
-func (s *rtspSession) RemoteAddr() net.Addr {
+func (s *rtspSession) remoteAddr() net.Addr {
 	return s.author.NetConn().RemoteAddr()
 }
 
@@ -112,28 +108,29 @@ func (s *rtspSession) onClose(err error) {
 
 	switch s.ss.State() {
 	case gortsplib.ServerSessionStatePrePlay, gortsplib.ServerSessionStatePlay:
-		s.path.onReaderRemove(pathReaderRemoveReq{author: s})
-		s.path = nil
+		s.path.readerRemove(pathReaderRemoveReq{author: s})
 
 	case gortsplib.ServerSessionStatePreRecord, gortsplib.ServerSessionStateRecord:
-		s.path.onPublisherRemove(pathPublisherRemoveReq{author: s})
-		s.path = nil
+		s.path.publisherRemove(pathPublisherRemoveReq{author: s})
 	}
+
+	s.path = nil
+	s.stream = nil
 
 	s.log(logger.Info, "destroyed (%v)", err)
 }
 
 // onAnnounce is called by rtspServer.
 func (s *rtspSession) onAnnounce(c *rtspConn, ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	res := s.pathManager.onPublisherAnnounce(pathPublisherAnnounceReq{
+	res := s.pathManager.publisherAdd(pathPublisherAddReq{
 		author:   s,
 		pathName: ctx.Path,
 		authenticate: func(
-			pathIPs []interface{},
+			pathIPs []fmt.Stringer,
 			pathUser conf.Credential,
 			pathPass conf.Credential,
 		) error {
-			return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, "publish", ctx.Request, ctx.Query)
+			return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, true, ctx.Request, ctx.Query)
 		},
 	})
 
@@ -185,15 +182,15 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 
 	switch s.ss.State() {
 	case gortsplib.ServerSessionStateInitial, gortsplib.ServerSessionStatePrePlay: // play
-		res := s.pathManager.onReaderSetupPlay(pathReaderSetupPlayReq{
+		res := s.pathManager.readerAdd(pathReaderAddReq{
 			author:   s,
 			pathName: ctx.Path,
 			authenticate: func(
-				pathIPs []interface{},
+				pathIPs []fmt.Stringer,
 				pathUser conf.Credential,
 				pathPass conf.Credential,
 			) error {
-				return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, "read", ctx.Request, ctx.Query)
+				return c.authenticate(ctx.Path, pathIPs, pathUser, pathPass, false, ctx.Request, ctx.Query)
 			},
 		})
 
@@ -222,6 +219,7 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 		}
 
 		s.path = res.path
+		s.stream = res.stream
 
 		if ctx.TrackID >= len(res.stream.tracks()) {
 			return &base.Response{
@@ -249,7 +247,19 @@ func (s *rtspSession) onPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 	h := make(base.Header)
 
 	if s.ss.State() == gortsplib.ServerSessionStatePrePlay {
-		s.path.onReaderPlay(pathReaderPlayReq{author: s})
+		s.path.readerStart(pathReaderStartReq{author: s})
+
+		tracks := make(gortsplib.Tracks, len(s.ss.SetuppedTracks()))
+		n := 0
+		for id := range s.ss.SetuppedTracks() {
+			tracks[n] = s.stream.tracks()[id]
+			n++
+		}
+
+		s.log(logger.Info, "is reading from path '%s', with %s, %s",
+			s.path.Name(),
+			s.ss.SetuppedTransport(),
+			sourceTrackInfo(tracks))
 
 		if s.path.Conf().RunOnRead != "" {
 			s.log(logger.Info, "runOnRead command started")
@@ -276,15 +286,21 @@ func (s *rtspSession) onPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 
 // onRecord is called by rtspServer.
 func (s *rtspSession) onRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	res := s.path.onPublisherRecord(pathPublisherRecordReq{
-		author: s,
-		tracks: s.announcedTracks,
+	res := s.path.publisherStart(pathPublisherStartReq{
+		author:             s,
+		tracks:             s.announcedTracks,
+		generateRTPPackets: false,
 	})
 	if res.err != nil {
 		return &base.Response{
 			StatusCode: base.StatusBadRequest,
 		}, res.err
 	}
+
+	s.log(logger.Info, "is publishing to path '%s', with %s, %s",
+		s.path.Name(),
+		s.ss.SetuppedTransport(),
+		sourceTrackInfo(s.announcedTracks))
 
 	s.stream = res.stream
 
@@ -306,14 +322,14 @@ func (s *rtspSession) onPause(ctx *gortsplib.ServerHandlerOnPauseCtx) (*base.Res
 			s.onReadCmd.Close()
 		}
 
-		s.path.onReaderPause(pathReaderPauseReq{author: s})
+		s.path.readerStop(pathReaderStopReq{author: s})
 
 		s.stateMutex.Lock()
 		s.state = gortsplib.ServerSessionStatePrePlay
 		s.stateMutex.Unlock()
 
 	case gortsplib.ServerSessionStateRecord:
-		s.path.onPublisherPause(pathPublisherPauseReq{author: s})
+		s.path.publisherStop(pathPublisherStopReq{author: s})
 
 		s.stateMutex.Lock()
 		s.state = gortsplib.ServerSessionStatePreRecord
@@ -325,29 +341,13 @@ func (s *rtspSession) onPause(ctx *gortsplib.ServerHandlerOnPauseCtx) (*base.Res
 	}, nil
 }
 
-// onReaderAccepted implements reader.
-func (s *rtspSession) onReaderAccepted() {
-	tracksLen := len(s.ss.SetuppedTracks())
-
-	s.log(logger.Info, "is reading from path '%s', %d %s with %s",
-		s.path.Name(),
-		tracksLen,
-		func() string {
-			if tracksLen == 1 {
-				return "track"
-			}
-			return "tracks"
-		}(),
-		s.ss.SetuppedTransport())
-}
-
 // onReaderData implements reader.
 func (s *rtspSession) onReaderData(data *data) {
 	// packets are routed to the session by gortsplib.ServerStream.
 }
 
-// onReaderAPIDescribe implements reader.
-func (s *rtspSession) onReaderAPIDescribe() interface{} {
+// apiReaderDescribe implements reader.
+func (s *rtspSession) apiReaderDescribe() interface{} {
 	var typ string
 	if s.isTLS {
 		typ = "rtspsSession"
@@ -361,8 +361,8 @@ func (s *rtspSession) onReaderAPIDescribe() interface{} {
 	}{typ, s.id}
 }
 
-// onSourceAPIDescribe implements source.
-func (s *rtspSession) onSourceAPIDescribe() interface{} {
+// apiSourceDescribe implements source.
+func (s *rtspSession) apiSourceDescribe() interface{} {
 	var typ string
 	if s.isTLS {
 		typ = "rtspsSession"
@@ -374,20 +374,6 @@ func (s *rtspSession) onSourceAPIDescribe() interface{} {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 	}{typ, s.id}
-}
-
-// onPublisherAccepted implements publisher.
-func (s *rtspSession) onPublisherAccepted(tracksLen int) {
-	s.log(logger.Info, "is publishing to path '%s', %d %s with %s",
-		s.path.Name(),
-		tracksLen,
-		func() string {
-			if tracksLen == 1 {
-				return "track"
-			}
-			return "tracks"
-		}(),
-		s.ss.SetuppedTransport())
 }
 
 // onPacketRTP is called by rtspServer.
@@ -395,15 +381,15 @@ func (s *rtspSession) onPacketRTP(ctx *gortsplib.ServerHandlerOnPacketRTPCtx) {
 	if ctx.H264NALUs != nil {
 		s.stream.writeData(&data{
 			trackID:      ctx.TrackID,
-			rtp:          ctx.Packet,
+			rtpPacket:    ctx.Packet,
 			ptsEqualsDTS: ctx.PTSEqualsDTS,
-			h264NALUs:    append([][]byte(nil), ctx.H264NALUs...),
-			h264PTS:      ctx.H264PTS,
+			pts:          ctx.H264PTS,
+			h264NALUs:    ctx.H264NALUs,
 		})
 	} else {
 		s.stream.writeData(&data{
 			trackID:      ctx.TrackID,
-			rtp:          ctx.Packet,
+			rtpPacket:    ctx.Packet,
 			ptsEqualsDTS: ctx.PTSEqualsDTS,
 		})
 	}

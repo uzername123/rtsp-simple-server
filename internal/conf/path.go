@@ -3,12 +3,12 @@ package conf
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
+	gourl "net/url"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/aler9/gortsplib/pkg/url"
 )
 
 var rePathName = regexp.MustCompile(`^[0-9a-zA-Z_\-/\.~]+$`)
@@ -49,14 +49,22 @@ type PathConf struct {
 	SourceRedirect             string         `json:"sourceRedirect"`
 	DisablePublisherOverride   bool           `json:"disablePublisherOverride"`
 	Fallback                   string         `json:"fallback"`
+	RPICameraCamID             int            `json:"rpiCameraCamID"`
+	RPICameraWidth             int            `json:"rpiCameraWidth"`
+	RPICameraHeight            int            `json:"rpiCameraHeight"`
+	RPICameraFPS               int            `json:"rpiCameraFPS"`
+	RPICameraIDRPeriod         int            `json:"rpiCameraIDRPeriod"`
+	RPICameraBitrate           int            `json:"rpiCameraBitrate"`
+	RPICameraProfile           string         `json:"rpiCameraProfile"`
+	RPICameraLevel             string         `json:"rpiCameraLevel"`
 
 	// authentication
 	PublishUser Credential `json:"publishUser"`
 	PublishPass Credential `json:"publishPass"`
-	PublishIPs  IPsOrNets  `json:"publishIPs"`
+	PublishIPs  IPsOrCIDRs `json:"publishIPs"`
 	ReadUser    Credential `json:"readUser"`
 	ReadPass    Credential `json:"readPass"`
-	ReadIPs     IPsOrNets  `json:"readIPs"`
+	ReadIPs     IPsOrCIDRs `json:"readIPs"`
 
 	// external commands
 	RunOnInit               string         `json:"runOnInit"`
@@ -105,21 +113,19 @@ func (pconf *PathConf) checkAndFillMissing(conf *Conf, name string) error {
 			return fmt.Errorf("a path with a regular expression (or path 'all') cannot have a RTSP source; use another path")
 		}
 
-		_, err := base.ParseURL(pconf.Source)
+		_, err := url.Parse(pconf.Source)
 		if err != nil {
 			return fmt.Errorf("'%s' is not a valid RTSP URL", pconf.Source)
 		}
 
-	case strings.HasPrefix(pconf.Source, "rtmp://"):
+	case strings.HasPrefix(pconf.Source, "rtmp://") ||
+		strings.HasPrefix(pconf.Source, "rtmps://"):
 		if pconf.Regexp != nil {
 			return fmt.Errorf("a path with a regular expression (or path 'all') cannot have a RTMP source; use another path")
 		}
 
-		u, err := url.Parse(pconf.Source)
+		u, err := gourl.Parse(pconf.Source)
 		if err != nil {
-			return fmt.Errorf("'%s' is not a valid RTMP URL", pconf.Source)
-		}
-		if u.Scheme != "rtmp" {
 			return fmt.Errorf("'%s' is not a valid RTMP URL", pconf.Source)
 		}
 
@@ -138,7 +144,7 @@ func (pconf *PathConf) checkAndFillMissing(conf *Conf, name string) error {
 			return fmt.Errorf("a path with a regular expression (or path 'all') cannot have a HLS source; use another path")
 		}
 
-		u, err := url.Parse(pconf.Source)
+		u, err := gourl.Parse(pconf.Source)
 		if err != nil {
 			return fmt.Errorf("'%s' is not a valid HLS URL", pconf.Source)
 		}
@@ -160,9 +166,32 @@ func (pconf *PathConf) checkAndFillMissing(conf *Conf, name string) error {
 			return fmt.Errorf("source redirect must be filled")
 		}
 
-		_, err := base.ParseURL(pconf.SourceRedirect)
+		_, err := url.Parse(pconf.SourceRedirect)
 		if err != nil {
 			return fmt.Errorf("'%s' is not a valid RTSP URL", pconf.SourceRedirect)
+		}
+
+	case pconf.Source == "rpiCamera":
+		if pconf.RPICameraWidth == 0 {
+			pconf.RPICameraWidth = 1280
+		}
+		if pconf.RPICameraHeight == 0 {
+			pconf.RPICameraHeight = 720
+		}
+		if pconf.RPICameraFPS == 0 {
+			pconf.RPICameraFPS = 30
+		}
+		if pconf.RPICameraIDRPeriod == 0 {
+			pconf.RPICameraIDRPeriod = 60
+		}
+		if pconf.RPICameraBitrate == 0 {
+			pconf.RPICameraBitrate = 1000000
+		}
+		if pconf.RPICameraProfile == "" {
+			pconf.RPICameraProfile = "main"
+		}
+		if pconf.RPICameraLevel == "" {
+			pconf.RPICameraLevel = "4.1"
 		}
 
 	default:
@@ -190,7 +219,7 @@ func (pconf *PathConf) checkAndFillMissing(conf *Conf, name string) error {
 				return fmt.Errorf("'%s': %s", pconf.Fallback, err)
 			}
 		} else {
-			_, err := base.ParseURL(pconf.Fallback)
+			_, err := url.Parse(pconf.Fallback)
 			if err != nil {
 				return fmt.Errorf("'%s' is not a valid RTSP URL", pconf.Fallback)
 			}

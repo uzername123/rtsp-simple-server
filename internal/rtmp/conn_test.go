@@ -1,50 +1,455 @@
 package rtmp
 
 import (
-	"bufio"
+	"bytes"
 	"net"
 	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/aac"
-	nh264 "github.com/notedit/rtmp/codec/h264"
+	"github.com/aler9/gortsplib/pkg/mpeg4audio"
 	"github.com/notedit/rtmp/format/flv/flvio"
 	"github.com/stretchr/testify/require"
 
-	"github.com/aler9/rtsp-simple-server/internal/rtmp/base"
+	"github.com/aler9/rtsp-simple-server/internal/rtmp/bytecounter"
+	"github.com/aler9/rtsp-simple-server/internal/rtmp/h264conf"
+	"github.com/aler9/rtsp-simple-server/internal/rtmp/handshake"
+	"github.com/aler9/rtsp-simple-server/internal/rtmp/message"
 )
 
-func splitPath(u *url.URL) (app, stream string) {
-	nu := *u
-	nu.ForceQuery = false
+func TestInitializeClient(t *testing.T) {
+	for _, ca := range []string{"read", "publish"} {
+		t.Run(ca, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:9121")
+			require.NoError(t, err)
+			defer ln.Close()
 
-	pathsegs := strings.Split(nu.RequestURI(), "/")
-	if len(pathsegs) == 2 {
-		app = pathsegs[1]
+			done := make(chan struct{})
+
+			go func() {
+				conn, err := ln.Accept()
+				require.NoError(t, err)
+				defer conn.Close()
+				bc := bytecounter.NewReadWriter(conn)
+
+				err = handshake.DoServer(bc, true)
+				require.NoError(t, err)
+
+				mrw := message.NewReadWriter(bc, true)
+
+				msg, err := mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgSetWindowAckSize{
+					Value: 2500000,
+				}, msg)
+
+				msg, err = mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgSetPeerBandwidth{
+					Value: 2500000,
+					Type:  2,
+				}, msg)
+
+				msg, err = mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgSetChunkSize{
+					Value: 65536,
+				}, msg)
+
+				msg, err = mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "connect",
+					CommandID:     1,
+					Arguments: []interface{}{
+						flvio.AMFMap{
+							{K: "app", V: "stream"},
+							{K: "flashVer", V: "LNX 9,0,124,2"},
+							{K: "tcUrl", V: "rtmp://127.0.0.1:9121/stream"},
+							{K: "fpad", V: false},
+							{K: "capabilities", V: float64(15)},
+							{K: "audioCodecs", V: float64(4071)},
+							{K: "videoCodecs", V: float64(252)},
+							{K: "videoFunction", V: float64(1)},
+						},
+					},
+				}, msg)
+
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "_result",
+					CommandID:     1,
+					Arguments: []interface{}{
+						flvio.AMFMap{
+							{K: "fmsVer", V: "LNX 9,0,124,2"},
+							{K: "capabilities", V: float64(31)},
+						},
+						flvio.AMFMap{
+							{K: "level", V: "status"},
+							{K: "code", V: "NetConnection.Connect.Success"},
+							{K: "description", V: "Connection succeeded."},
+							{K: "objectEncoding", V: float64(0)},
+						},
+					},
+				})
+				require.NoError(t, err)
+
+				if ca == "read" {
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "createStream",
+						CommandID:     2,
+						Arguments: []interface{}{
+							nil,
+						},
+					}, msg)
+
+					err = mrw.Write(&message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "_result",
+						CommandID:     2,
+						Arguments: []interface{}{
+							nil,
+							float64(1),
+						},
+					})
+					require.NoError(t, err)
+
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgUserControlSetBufferLength{
+						BufferLength: 0x64,
+					}, msg)
+
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID:   4,
+						MessageStreamID: 0x1000000,
+						Name:            "play",
+						CommandID:       3,
+						Arguments: []interface{}{
+							nil,
+							"",
+						},
+					}, msg)
+
+					err = mrw.Write(&message.MsgCommandAMF0{
+						ChunkStreamID:   5,
+						MessageStreamID: 0x1000000,
+						Name:            "onStatus",
+						CommandID:       3,
+						Arguments: []interface{}{
+							nil,
+							flvio.AMFMap{
+								{K: "level", V: "status"},
+								{K: "code", V: "NetStream.Play.Reset"},
+								{K: "description", V: "play reset"},
+							},
+						},
+					})
+					require.NoError(t, err)
+				} else {
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "releaseStream",
+						CommandID:     2,
+						Arguments: []interface{}{
+							nil,
+							"",
+						},
+					}, msg)
+
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "FCPublish",
+						CommandID:     3,
+						Arguments: []interface{}{
+							nil,
+							"",
+						},
+					}, msg)
+
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "createStream",
+						CommandID:     4,
+						Arguments: []interface{}{
+							nil,
+						},
+					}, msg)
+
+					err = mrw.Write(&message.MsgCommandAMF0{
+						ChunkStreamID: 3,
+						Name:          "_result",
+						CommandID:     4,
+						Arguments: []interface{}{
+							nil,
+							float64(1),
+						},
+					})
+					require.NoError(t, err)
+
+					msg, err = mrw.Read()
+					require.NoError(t, err)
+					require.Equal(t, &message.MsgCommandAMF0{
+						ChunkStreamID:   4,
+						MessageStreamID: 0x1000000,
+						Name:            "publish",
+						CommandID:       5,
+						Arguments: []interface{}{
+							nil,
+							"",
+							"stream",
+						},
+					}, msg)
+
+					err = mrw.Write(&message.MsgCommandAMF0{
+						ChunkStreamID:   5,
+						MessageStreamID: 0x1000000,
+						Name:            "onStatus",
+						CommandID:       5,
+						Arguments: []interface{}{
+							nil,
+							flvio.AMFMap{
+								{K: "level", V: "status"},
+								{K: "code", V: "NetStream.Publish.Start"},
+								{K: "description", V: "publish start"},
+							},
+						},
+					})
+					require.NoError(t, err)
+				}
+
+				close(done)
+			}()
+
+			u, err := url.Parse("rtmp://127.0.0.1:9121/stream")
+			require.NoError(t, err)
+
+			nconn, err := net.Dial("tcp", u.Host)
+			require.NoError(t, err)
+			defer nconn.Close()
+			conn := NewConn(nconn)
+
+			err = conn.InitializeClient(u, ca == "publish")
+			require.NoError(t, err)
+
+			<-done
+		})
 	}
-	if len(pathsegs) == 3 {
-		app = pathsegs[1]
-		stream = pathsegs[2]
-	}
-	if len(pathsegs) > 3 {
-		app = strings.Join(pathsegs[1:3], "/")
-		stream = strings.Join(pathsegs[3:], "/")
-	}
-	return
 }
 
-func getTcURL(u string) string {
-	ur, err := url.Parse(u)
-	if err != nil {
-		panic(err)
+func TestInitializeServer(t *testing.T) {
+	for _, ca := range []string{"read", "publish"} {
+		t.Run(ca, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:9121")
+			require.NoError(t, err)
+			defer ln.Close()
+
+			done := make(chan struct{})
+
+			go func() {
+				nconn, err := ln.Accept()
+				require.NoError(t, err)
+				defer nconn.Close()
+
+				conn := NewConn(nconn)
+				u, isPublishing, err := conn.InitializeServer()
+				require.NoError(t, err)
+				require.Equal(t, &url.URL{
+					Scheme: "rtmp",
+					Host:   "127.0.0.1:9121",
+					Path:   "//stream/",
+				}, u)
+				require.Equal(t, ca == "publish", isPublishing)
+
+				close(done)
+			}()
+
+			conn, err := net.Dial("tcp", "127.0.0.1:9121")
+			require.NoError(t, err)
+			defer conn.Close()
+			bc := bytecounter.NewReadWriter(conn)
+
+			err = handshake.DoClient(bc, true)
+			require.NoError(t, err)
+
+			mrw := message.NewReadWriter(bc, true)
+
+			err = mrw.Write(&message.MsgCommandAMF0{
+				ChunkStreamID: 3,
+				Name:          "connect",
+				CommandID:     1,
+				Arguments: []interface{}{
+					flvio.AMFMap{
+						{K: "app", V: "/stream"},
+						{K: "flashVer", V: "LNX 9,0,124,2"},
+						{K: "tcUrl", V: "rtmp://127.0.0.1:9121/stream"},
+						{K: "fpad", V: false},
+						{K: "capabilities", V: 15},
+						{K: "audioCodecs", V: 4071},
+						{K: "videoCodecs", V: 252},
+						{K: "videoFunction", V: 1},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			msg, err := mrw.Read()
+			require.NoError(t, err)
+			require.Equal(t, &message.MsgSetWindowAckSize{
+				Value: 2500000,
+			}, msg)
+
+			msg, err = mrw.Read()
+			require.NoError(t, err)
+			require.Equal(t, &message.MsgSetPeerBandwidth{
+				Value: 2500000,
+				Type:  2,
+			}, msg)
+
+			msg, err = mrw.Read()
+			require.NoError(t, err)
+			require.Equal(t, &message.MsgSetChunkSize{
+				Value: 65536,
+			}, msg)
+
+			msg, err = mrw.Read()
+			require.NoError(t, err)
+			require.Equal(t, &message.MsgCommandAMF0{
+				ChunkStreamID: 3,
+				Name:          "_result",
+				CommandID:     1,
+				Arguments: []interface{}{
+					flvio.AMFMap{
+						{K: "fmsVer", V: "LNX 9,0,124,2"},
+						{K: "capabilities", V: float64(31)},
+					},
+					flvio.AMFMap{
+						{K: "level", V: "status"},
+						{K: "code", V: "NetConnection.Connect.Success"},
+						{K: "description", V: "Connection succeeded."},
+						{K: "objectEncoding", V: float64(0)},
+					},
+				},
+			}, msg)
+
+			err = mrw.Write(&message.MsgSetChunkSize{
+				Value: 65536,
+			})
+			require.NoError(t, err)
+
+			if ca == "read" {
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "createStream",
+					CommandID:     2,
+					Arguments: []interface{}{
+						nil,
+					},
+				})
+				require.NoError(t, err)
+
+				msg, err = mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "_result",
+					CommandID:     2,
+					Arguments: []interface{}{
+						nil,
+						float64(1),
+					},
+				}, msg)
+
+				err = mrw.Write(&message.MsgUserControlSetBufferLength{
+					BufferLength: 0x64,
+				})
+				require.NoError(t, err)
+
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID:   4,
+					MessageStreamID: 0x1000000,
+					Name:            "play",
+					CommandID:       0,
+					Arguments: []interface{}{
+						nil,
+						"",
+					},
+				})
+				require.NoError(t, err)
+			} else {
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "releaseStream",
+					CommandID:     2,
+					Arguments: []interface{}{
+						nil,
+						"",
+					},
+				})
+				require.NoError(t, err)
+
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "FCPublish",
+					CommandID:     3,
+					Arguments: []interface{}{
+						nil,
+						"",
+					},
+				})
+				require.NoError(t, err)
+
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "createStream",
+					CommandID:     4,
+					Arguments: []interface{}{
+						nil,
+					},
+				})
+				require.NoError(t, err)
+
+				msg, err = mrw.Read()
+				require.NoError(t, err)
+				require.Equal(t, &message.MsgCommandAMF0{
+					ChunkStreamID: 3,
+					Name:          "_result",
+					CommandID:     4,
+					Arguments: []interface{}{
+						nil,
+						float64(1),
+					},
+				}, msg)
+
+				err = mrw.Write(&message.MsgCommandAMF0{
+					ChunkStreamID:   4,
+					MessageStreamID: 0x1000000,
+					Name:            "publish",
+					CommandID:       5,
+					Arguments: []interface{}{
+						nil,
+						"",
+						"stream",
+					},
+				})
+				require.NoError(t, err)
+			}
+
+			<-done
+		})
 	}
-	app, _ := splitPath(ur)
-	nu := *ur
-	nu.RawQuery = ""
-	nu.Path = "/"
-	return nu.String() + app
 }
 
 func TestReadTracks(t *testing.T) {
@@ -59,9 +464,10 @@ func TestReadTracks(t *testing.T) {
 	}
 
 	for _, ca := range []string{
-		"standard",
+		"video+audio",
+		"video",
 		"metadata without codec id",
-		"no metadata",
+		"missing metadata",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:9121")
@@ -75,36 +481,79 @@ func TestReadTracks(t *testing.T) {
 				require.NoError(t, err)
 				defer conn.Close()
 
-				rconn := NewServerConn(conn)
-				err = rconn.ServerHandshake()
+				rconn := NewConn(conn)
+				_, _, err = rconn.InitializeServer()
 				require.NoError(t, err)
 
 				videoTrack, audioTrack, err := rconn.ReadTracks()
 				require.NoError(t, err)
 
 				switch ca {
-				case "standard":
-					videoTrack2, err := gortsplib.NewTrackH264(96, sps, pps, nil)
-					require.NoError(t, err)
-					require.Equal(t, videoTrack2, videoTrack)
+				case "video+audio":
+					require.Equal(t, &gortsplib.TrackH264{
+						PayloadType: 96,
+						SPS:         sps,
+						PPS:         pps,
+					}, videoTrack)
 
-					audioTrack2, err := gortsplib.NewTrackAAC(96, 2, 44100, 2, nil, 13, 3, 3)
-					require.NoError(t, err)
-					require.Equal(t, audioTrack2, audioTrack)
+					require.Equal(t, &gortsplib.TrackMPEG4Audio{
+						PayloadType: 96,
+						Config: &mpeg4audio.Config{
+							Type:         2,
+							SampleRate:   44100,
+							ChannelCount: 2,
+						},
+						SizeLength:       13,
+						IndexLength:      3,
+						IndexDeltaLength: 3,
+					}, audioTrack)
+
+				case "video":
+					require.Equal(t, &gortsplib.TrackH264{
+						PayloadType: 96,
+						SPS:         sps,
+						PPS:         pps,
+					}, videoTrack)
+
+					require.Nil(t, audioTrack)
 
 				case "metadata without codec id":
-					videoTrack2, err := gortsplib.NewTrackH264(96, sps, pps, nil)
-					require.NoError(t, err)
-					require.Equal(t, videoTrack2, videoTrack)
+					require.Equal(t, &gortsplib.TrackH264{
+						PayloadType: 96,
+						SPS:         sps,
+						PPS:         pps,
+					}, videoTrack)
 
-					require.Equal(t, (*gortsplib.TrackAAC)(nil), audioTrack)
+					require.Equal(t, &gortsplib.TrackMPEG4Audio{
+						PayloadType: 96,
+						Config: &mpeg4audio.Config{
+							Type:         2,
+							SampleRate:   44100,
+							ChannelCount: 2,
+						},
+						SizeLength:       13,
+						IndexLength:      3,
+						IndexDeltaLength: 3,
+					}, audioTrack)
 
-				case "no metadata":
-					videoTrack2, err := gortsplib.NewTrackH264(96, sps, pps, nil)
-					require.NoError(t, err)
-					require.Equal(t, videoTrack2, videoTrack)
+				case "missing metadata":
+					require.Equal(t, &gortsplib.TrackH264{
+						PayloadType: 96,
+						SPS:         sps,
+						PPS:         pps,
+					}, videoTrack)
 
-					require.Equal(t, (*gortsplib.TrackAAC)(nil), audioTrack)
+					require.Equal(t, &gortsplib.TrackMPEG4Audio{
+						PayloadType: 96,
+						Config: &mpeg4audio.Config{
+							Type:         2,
+							SampleRate:   44100,
+							ChannelCount: 2,
+						},
+						SizeLength:       13,
+						IndexLength:      3,
+						IndexDeltaLength: 3,
+					}, audioTrack)
 				}
 
 				close(done)
@@ -113,339 +562,339 @@ func TestReadTracks(t *testing.T) {
 			conn, err := net.Dial("tcp", "127.0.0.1:9121")
 			require.NoError(t, err)
 			defer conn.Close()
+			bc := bytecounter.NewReadWriter(conn)
 
-			// C->S handshake C0
-			err = base.HandshakeC0{}.Write(conn)
+			err = handshake.DoClient(bc, true)
 			require.NoError(t, err)
 
-			// C->S handshake C1
-			err = base.HandshakeC1{}.Write(conn)
-			require.NoError(t, err)
+			mrw := message.NewReadWriter(bc, true)
 
-			// S->C handshake S0
-			err = base.HandshakeS0{}.Read(conn)
-			require.NoError(t, err)
-
-			// S->C handshake S1+S2
-			s1s2 := make([]byte, 1536*2)
-			_, err = conn.Read(s1s2)
-			require.NoError(t, err)
-
-			// C->S handshake C2
-			err = base.HandshakeC2{}.Write(conn, s1s2)
-			require.NoError(t, err)
-
-			mw := base.NewMessageWriter(conn)
-			mr := base.NewMessageReader(bufio.NewReader(conn))
-
-			// C->S connect
-			byts := flvio.FillAMF0ValsMalloc([]interface{}{
-				"connect",
-				1,
-				flvio.AMFMap{
-					{K: "app", V: "/stream"},
-					{K: "flashVer", V: "LNX 9,0,124,2"},
-					{K: "tcUrl", V: getTcURL("rtmp://127.0.0.1:9121/stream")},
-					{K: "fpad", V: false},
-					{K: "capabilities", V: 15},
-					{K: "audioCodecs", V: 4071},
-					{K: "videoCodecs", V: 252},
-					{K: "videoFunction", V: 1},
-				},
-			})
-			err = mw.Write(&base.Message{
+			err = mrw.Write(&message.MsgCommandAMF0{
 				ChunkStreamID: 3,
-				Type:          base.MessageTypeCommandAMF0,
-				Body:          byts,
+				Name:          "connect",
+				CommandID:     1,
+				Arguments: []interface{}{
+					flvio.AMFMap{
+						{K: "app", V: "/stream"},
+						{K: "flashVer", V: "LNX 9,0,124,2"},
+						{K: "tcUrl", V: "rtmp://127.0.0.1:9121/stream"},
+						{K: "fpad", V: false},
+						{K: "capabilities", V: 15},
+						{K: "audioCodecs", V: 4071},
+						{K: "videoCodecs", V: 252},
+						{K: "videoFunction", V: 1},
+					},
+				},
 			})
 			require.NoError(t, err)
 
-			// S->C window acknowledgement size
-			msg, err := mr.Read()
+			msg, err := mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, &base.Message{
-				ChunkStreamID: base.ControlChunkStreamID,
-				Type:          base.MessageTypeSetWindowAckSize,
-				Body:          []byte{0x00, 38, 37, 160},
+			require.Equal(t, &message.MsgSetWindowAckSize{
+				Value: 2500000,
 			}, msg)
 
-			// S->C set peer bandwidth
-			msg, err = mr.Read()
+			msg, err = mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, &base.Message{
-				ChunkStreamID: base.ControlChunkStreamID,
-				Type:          base.MessageTypeSetPeerBandwidth,
-				Body:          []byte{0x00, 0x26, 0x25, 0xa0, 0x02},
+			require.Equal(t, &message.MsgSetPeerBandwidth{
+				Value: 2500000,
+				Type:  2,
 			}, msg)
 
-			// S->C set chunk size
-			msg, err = mr.Read()
+			msg, err = mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, &base.Message{
-				ChunkStreamID: base.ControlChunkStreamID,
-				Type:          base.MessageTypeSetChunkSize,
-				Body:          []byte{0x00, 0x01, 0x00, 0x00},
+			require.Equal(t, &message.MsgSetChunkSize{
+				Value: 65536,
 			}, msg)
 
-			mr.SetChunkSize(65536)
-
-			// S->C result
-			msg, err = mr.Read()
+			msg, err = mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, uint8(3), msg.ChunkStreamID)
-			require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-			arr, err := flvio.ParseAMFVals(msg.Body, false)
-			require.NoError(t, err)
-			require.Equal(t, []interface{}{
-				"_result",
-				float64(1),
-				flvio.AMFMap{
-					{K: "fmsVer", V: "LNX 9,0,124,2"},
-					{K: "capabilities", V: float64(31)},
-				},
-				flvio.AMFMap{
-					{K: "level", V: "status"},
-					{K: "code", V: "NetConnection.Connect.Success"},
-					{K: "description", V: "Connection succeeded."},
-					{K: "objectEncoding", V: float64(0)},
-				},
-			}, arr)
-
-			// C->S set chunk size
-			err = mw.Write(&base.Message{
-				ChunkStreamID: base.ControlChunkStreamID,
-				Type:          base.MessageTypeSetChunkSize,
-				Body:          []byte{0x00, 0x01, 0x00, 0x00},
-			})
-			require.NoError(t, err)
-
-			mw.SetChunkSize(65536)
-
-			// C->S releaseStream
-			err = mw.Write(&base.Message{
+			require.Equal(t, &message.MsgCommandAMF0{
 				ChunkStreamID: 3,
-				Type:          base.MessageTypeCommandAMF0,
-				Body: flvio.FillAMF0ValsMalloc([]interface{}{
-					"releaseStream",
-					float64(2),
+				Name:          "_result",
+				CommandID:     1,
+				Arguments: []interface{}{
+					flvio.AMFMap{
+						{K: "fmsVer", V: "LNX 9,0,124,2"},
+						{K: "capabilities", V: float64(31)},
+					},
+					flvio.AMFMap{
+						{K: "level", V: "status"},
+						{K: "code", V: "NetConnection.Connect.Success"},
+						{K: "description", V: "Connection succeeded."},
+						{K: "objectEncoding", V: float64(0)},
+					},
+				},
+			}, msg)
+
+			err = mrw.Write(&message.MsgSetChunkSize{
+				Value: 65536,
+			})
+			require.NoError(t, err)
+
+			err = mrw.Write(&message.MsgCommandAMF0{
+				ChunkStreamID: 3,
+				Name:          "releaseStream",
+				CommandID:     2,
+				Arguments: []interface{}{
 					nil,
 					"",
-				}),
+				},
 			})
 			require.NoError(t, err)
 
-			// C->S FCPublish
-			err = mw.Write(&base.Message{
+			err = mrw.Write(&message.MsgCommandAMF0{
 				ChunkStreamID: 3,
-				Type:          base.MessageTypeCommandAMF0,
-				Body: flvio.FillAMF0ValsMalloc([]interface{}{
-					"FCPublish",
-					float64(3),
+				Name:          "FCPublish",
+				CommandID:     3,
+				Arguments: []interface{}{
 					nil,
 					"",
-				}),
+				},
 			})
 			require.NoError(t, err)
 
-			// C->S createStream
-			err = mw.Write(&base.Message{
+			err = mrw.Write(&message.MsgCommandAMF0{
 				ChunkStreamID: 3,
-				Type:          base.MessageTypeCommandAMF0,
-				Body: flvio.FillAMF0ValsMalloc([]interface{}{
-					"createStream",
-					float64(4),
+				Name:          "createStream",
+				CommandID:     4,
+				Arguments: []interface{}{
 					nil,
-				}),
+				},
 			})
 			require.NoError(t, err)
 
-			// S->C result
-			msg, err = mr.Read()
+			msg, err = mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, uint8(3), msg.ChunkStreamID)
-			require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-			arr, err = flvio.ParseAMFVals(msg.Body, false)
-			require.NoError(t, err)
-			require.Equal(t, []interface{}{
-				"_result",
-				float64(4),
-				nil,
-				float64(1),
-			}, arr)
+			require.Equal(t, &message.MsgCommandAMF0{
+				ChunkStreamID: 3,
+				Name:          "_result",
+				CommandID:     4,
+				Arguments: []interface{}{
+					nil,
+					float64(1),
+				},
+			}, msg)
 
-			// C->S publish
-			err = mw.Write(&base.Message{
+			err = mrw.Write(&message.MsgCommandAMF0{
 				ChunkStreamID:   8,
-				Type:            base.MessageTypeCommandAMF0,
 				MessageStreamID: 1,
-				Body: flvio.FillAMF0ValsMalloc([]interface{}{
-					"publish",
-					float64(5),
+				Name:            "publish",
+				CommandID:       5,
+				Arguments: []interface{}{
 					nil,
 					"",
 					"live",
-				}),
+				},
 			})
 			require.NoError(t, err)
 
-			// S->C onStatus
-			msg, err = mr.Read()
+			msg, err = mrw.Read()
 			require.NoError(t, err)
-			require.Equal(t, uint8(5), msg.ChunkStreamID)
-			require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-			arr, err = flvio.ParseAMFVals(msg.Body, false)
-			require.NoError(t, err)
-			require.Equal(t, []interface{}{
-				"onStatus",
-				float64(5),
-				nil,
-				flvio.AMFMap{
-					{K: "level", V: "status"},
-					{K: "code", V: "NetStream.Publish.Start"},
-					{K: "description", V: "publish start"},
+			require.Equal(t, &message.MsgCommandAMF0{
+				ChunkStreamID:   5,
+				MessageStreamID: 0x1000000,
+				Name:            "onStatus",
+				CommandID:       5,
+				Arguments: []interface{}{
+					nil,
+					flvio.AMFMap{
+						{K: "level", V: "status"},
+						{K: "code", V: "NetStream.Publish.Start"},
+						{K: "description", V: "publish start"},
+					},
 				},
-			}, arr)
+			}, msg)
 
 			switch ca {
-			case "standard":
-				// C->S metadata
-				byts = flvio.FillAMF0ValsMalloc([]interface{}{
-					"@setDataFrame",
-					"onMetaData",
-					flvio.AMFMap{
-						{
-							K: "videodatarate",
-							V: float64(0),
-						},
-						{
-							K: "videocodecid",
-							V: float64(codecH264),
-						},
-						{
-							K: "audiodatarate",
-							V: float64(0),
-						},
-						{
-							K: "audiocodecid",
-							V: float64(codecAAC),
-						},
-					},
-				})
-				err = mw.Write(&base.Message{
+			case "video+audio":
+
+				err = mrw.Write(&message.MsgDataAMF0{
 					ChunkStreamID:   4,
-					Type:            base.MessageTypeDataAMF0,
 					MessageStreamID: 1,
-					Body:            byts,
+					Payload: []interface{}{
+						"@setDataFrame",
+						"onMetaData",
+						flvio.AMFMap{
+							{
+								K: "videodatarate",
+								V: float64(0),
+							},
+							{
+								K: "videocodecid",
+								V: float64(codecH264),
+							},
+							{
+								K: "audiodatarate",
+								V: float64(0),
+							},
+							{
+								K: "audiocodecid",
+								V: float64(codecAAC),
+							},
+						},
+					},
 				})
 				require.NoError(t, err)
 
-				// C->S H264 decoder config
-				codec := nh264.Codec{
-					SPS: map[int][]byte{
-						0: sps,
-					},
-					PPS: map[int][]byte{
-						0: pps,
-					},
-				}
-				b := make([]byte, 128)
-				var n int
-				codec.ToConfig(b, &n)
-				body := append([]byte{flvio.FRAME_KEY<<4 | flvio.VIDEO_H264, 0, 0, 0, 0}, b[:n]...)
-				err = mw.Write(&base.Message{
-					ChunkStreamID:   6,
-					Type:            base.MessageTypeVideo,
-					MessageStreamID: 1,
-					Body:            body,
+				buf, _ := h264conf.Conf{
+					SPS: sps,
+					PPS: pps,
+				}.Marshal()
+				err = mrw.Write(&message.MsgVideo{
+					ChunkStreamID:   message.MsgVideoChunkStreamID,
+					MessageStreamID: 0x1000000,
+					IsKeyFrame:      true,
+					H264Type:        flvio.AVC_SEQHDR,
+					Payload:         buf,
 				})
 				require.NoError(t, err)
 
-				// C->S AAC decoder config
-				enc, err := aac.MPEG4AudioConfig{
+				enc, err := mpeg4audio.Config{
 					Type:         2,
 					SampleRate:   44100,
 					ChannelCount: 2,
-				}.Encode()
+				}.Marshal()
 				require.NoError(t, err)
-				err = mw.Write(&base.Message{
+				err = mrw.Write(&message.MsgAudio{
+					ChunkStreamID:   message.MsgAudioChunkStreamID,
+					MessageStreamID: 0x1000000,
+					Rate:            flvio.SOUND_44Khz,
+					Depth:           flvio.SOUND_16BIT,
+					Channels:        flvio.SOUND_STEREO,
+					AACType:         flvio.AAC_SEQHDR,
+					Payload:         enc,
+				})
+				require.NoError(t, err)
+
+			case "video":
+
+				err = mrw.Write(&message.MsgDataAMF0{
 					ChunkStreamID:   4,
-					Type:            base.MessageTypeAudio,
 					MessageStreamID: 1,
-					Body: append([]byte{
-						flvio.SOUND_AAC<<4 | flvio.SOUND_44Khz<<2 | flvio.SOUND_16BIT<<1 | flvio.SOUND_STEREO,
-						flvio.AAC_SEQHDR,
-					}, enc...),
+					Payload: []interface{}{
+						"@setDataFrame",
+						"onMetaData",
+						flvio.AMFMap{
+							{
+								K: "videodatarate",
+								V: float64(0),
+							},
+							{
+								K: "videocodecid",
+								V: float64(codecH264),
+							},
+							{
+								K: "audiodatarate",
+								V: float64(0),
+							},
+							{
+								K: "audiocodecid",
+								V: float64(0),
+							},
+						},
+					},
+				})
+				require.NoError(t, err)
+
+				buf, _ := h264conf.Conf{
+					SPS: sps,
+					PPS: pps,
+				}.Marshal()
+				err = mrw.Write(&message.MsgVideo{
+					ChunkStreamID:   message.MsgVideoChunkStreamID,
+					MessageStreamID: 0x1000000,
+					IsKeyFrame:      true,
+					H264Type:        flvio.AVC_SEQHDR,
+					Payload:         buf,
 				})
 				require.NoError(t, err)
 
 			case "metadata without codec id":
-				// C->S metadata
-				byts = flvio.FillAMF0ValsMalloc([]interface{}{
-					"@setDataFrame",
-					"onMetaData",
-					flvio.AMFMap{
-						{
-							K: "width",
-							V: float64(2688),
-						},
-						{
-							K: "height",
-							V: float64(1520),
-						},
-						{
-							K: "framerate",
-							V: float64(0o25),
-						},
-					},
-				})
-				err = mw.Write(&base.Message{
+
+				err = mrw.Write(&message.MsgDataAMF0{
 					ChunkStreamID:   4,
-					Type:            base.MessageTypeDataAMF0,
 					MessageStreamID: 1,
-					Body:            byts,
+					Payload: []interface{}{
+						"@setDataFrame",
+						"onMetaData",
+						flvio.AMFMap{
+							{
+								K: "width",
+								V: float64(2688),
+							},
+							{
+								K: "height",
+								V: float64(1520),
+							},
+							{
+								K: "framerate",
+								V: float64(0o25),
+							},
+						},
+					},
 				})
 				require.NoError(t, err)
 
-				// C->S H264 decoder config
-				codec := nh264.Codec{
-					SPS: map[int][]byte{
-						0: sps,
-					},
-					PPS: map[int][]byte{
-						0: pps,
-					},
-				}
-				b := make([]byte, 128)
-				var n int
-				codec.ToConfig(b, &n)
-				body := append([]byte{flvio.FRAME_KEY<<4 | flvio.VIDEO_H264, 0, 0, 0, 0}, b[:n]...)
-				err = mw.Write(&base.Message{
-					ChunkStreamID:   6,
-					Type:            base.MessageTypeVideo,
-					MessageStreamID: 1,
-					Body:            body,
+				buf, _ := h264conf.Conf{
+					SPS: sps,
+					PPS: pps,
+				}.Marshal()
+				err = mrw.Write(&message.MsgVideo{
+					ChunkStreamID:   message.MsgVideoChunkStreamID,
+					MessageStreamID: 0x1000000,
+					IsKeyFrame:      true,
+					H264Type:        flvio.AVC_SEQHDR,
+					Payload:         buf,
 				})
 				require.NoError(t, err)
 
-			case "no metadata":
-				// C->S H264 decoder config
-				codec := nh264.Codec{
-					SPS: map[int][]byte{
-						0: sps,
-					},
-					PPS: map[int][]byte{
-						0: pps,
-					},
-				}
-				b := make([]byte, 128)
-				var n int
-				codec.ToConfig(b, &n)
-				body := append([]byte{flvio.FRAME_KEY<<4 | flvio.VIDEO_H264, 0, 0, 0, 0}, b[:n]...)
-				err = mw.Write(&base.Message{
-					ChunkStreamID:   6,
-					Type:            base.MessageTypeVideo,
-					MessageStreamID: 1,
-					Body:            body,
+				enc, err := mpeg4audio.Config{
+					Type:         2,
+					SampleRate:   44100,
+					ChannelCount: 2,
+				}.Marshal()
+				require.NoError(t, err)
+				err = mrw.Write(&message.MsgAudio{
+					ChunkStreamID:   message.MsgAudioChunkStreamID,
+					MessageStreamID: 0x1000000,
+					Rate:            flvio.SOUND_44Khz,
+					Depth:           flvio.SOUND_16BIT,
+					Channels:        flvio.SOUND_STEREO,
+					AACType:         flvio.AAC_SEQHDR,
+					Payload:         enc,
+				})
+				require.NoError(t, err)
+
+			case "missing metadata":
+
+				buf, _ := h264conf.Conf{
+					SPS: sps,
+					PPS: pps,
+				}.Marshal()
+				err = mrw.Write(&message.MsgVideo{
+					ChunkStreamID:   message.MsgVideoChunkStreamID,
+					MessageStreamID: 0x1000000,
+					IsKeyFrame:      true,
+					H264Type:        flvio.AVC_SEQHDR,
+					Payload:         buf,
+				})
+				require.NoError(t, err)
+
+				enc, err := mpeg4audio.Config{
+					Type:         2,
+					SampleRate:   44100,
+					ChannelCount: 2,
+				}.Marshal()
+				require.NoError(t, err)
+				err = mrw.Write(&message.MsgAudio{
+					ChunkStreamID:   message.MsgAudioChunkStreamID,
+					MessageStreamID: 0x1000000,
+					Rate:            flvio.SOUND_44Khz,
+					Depth:           flvio.SOUND_16BIT,
+					Channels:        flvio.SOUND_STEREO,
+					AACType:         flvio.AAC_SEQHDR,
+					Payload:         enc,
 				})
 				require.NoError(t, err)
 			}
@@ -465,24 +914,33 @@ func TestWriteTracks(t *testing.T) {
 		require.NoError(t, err)
 		defer conn.Close()
 
-		rconn := NewServerConn(conn)
-		err = rconn.ServerHandshake()
+		rconn := NewConn(conn)
+		_, _, err = rconn.InitializeServer()
 		require.NoError(t, err)
 
-		videoTrack, err := gortsplib.NewTrackH264(96,
-			[]byte{
+		videoTrack := &gortsplib.TrackH264{
+			PayloadType: 96,
+			SPS: []byte{
 				0x67, 0x64, 0x00, 0x0c, 0xac, 0x3b, 0x50, 0xb0,
 				0x4b, 0x42, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00,
 				0x00, 0x03, 0x00, 0x3d, 0x08,
 			},
-			[]byte{
+			PPS: []byte{
 				0x68, 0xee, 0x3c, 0x80,
 			},
-			nil)
-		require.NoError(t, err)
+		}
 
-		audioTrack, err := gortsplib.NewTrackAAC(96, 2, 44100, 2, nil, 13, 3, 3)
-		require.NoError(t, err)
+		audioTrack := &gortsplib.TrackMPEG4Audio{
+			PayloadType: 96,
+			Config: &mpeg4audio.Config{
+				Type:         2,
+				SampleRate:   44100,
+				ChannelCount: 2,
+			},
+			SizeLength:       13,
+			IndexLength:      3,
+			IndexDeltaLength: 3,
+		}
 
 		err = rconn.WriteTracks(videoTrack, audioTrack)
 		require.NoError(t, err)
@@ -491,301 +949,279 @@ func TestWriteTracks(t *testing.T) {
 	conn, err := net.Dial("tcp", "127.0.0.1:9121")
 	require.NoError(t, err)
 	defer conn.Close()
+	bc := bytecounter.NewReadWriter(conn)
 
-	// C->S handshake C0
-	err = base.HandshakeC0{}.Write(conn)
+	err = handshake.DoClient(bc, true)
 	require.NoError(t, err)
 
-	// C-> handshake C1
-	err = base.HandshakeC1{}.Write(conn)
-	require.NoError(t, err)
+	mrw := message.NewReadWriter(bc, true)
 
-	// S->C handshake S0
-	err = base.HandshakeS0{}.Read(conn)
-	require.NoError(t, err)
-
-	// S->C handshake S1+S2
-	s1s2 := make([]byte, 1536*2)
-	_, err = conn.Read(s1s2)
-	require.NoError(t, err)
-
-	// C->S handshake C2
-	err = base.HandshakeC2{}.Write(conn, s1s2)
-	require.NoError(t, err)
-
-	mw := base.NewMessageWriter(conn)
-	mr := base.NewMessageReader(bufio.NewReader(conn))
-
-	// C->S connect
-	byts := flvio.FillAMF0ValsMalloc([]interface{}{
-		"connect",
-		1,
-		flvio.AMFMap{
-			{K: "app", V: "/stream"},
-			{K: "flashVer", V: "LNX 9,0,124,2"},
-			{K: "tcUrl", V: getTcURL("rtmp://127.0.0.1:9121/stream")},
-			{K: "fpad", V: false},
-			{K: "capabilities", V: 15},
-			{K: "audioCodecs", V: 4071},
-			{K: "videoCodecs", V: 252},
-			{K: "videoFunction", V: 1},
-		},
-	})
-	err = mw.Write(&base.Message{
+	err = mrw.Write(&message.MsgCommandAMF0{
 		ChunkStreamID: 3,
-		Type:          base.MessageTypeCommandAMF0,
-		Body:          byts,
-	})
-	require.NoError(t, err)
-
-	// S->C window acknowledgement size
-	msg, err := mr.Read()
-	require.NoError(t, err)
-	require.Equal(t, &base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeSetWindowAckSize,
-		Body:          []byte{0x00, 38, 37, 160},
-	}, msg)
-
-	// S->C set peer bandwidth
-	msg, err = mr.Read()
-	require.NoError(t, err)
-	require.Equal(t, &base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeSetPeerBandwidth,
-		Body:          []byte{0x00, 0x26, 0x25, 0xa0, 0x02},
-	}, msg)
-
-	// S->C set chunk size
-	msg, err = mr.Read()
-	require.NoError(t, err)
-	require.Equal(t, &base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeSetChunkSize,
-		Body:          []byte{0x00, 0x01, 0x00, 0x00},
-	}, msg)
-
-	mr.SetChunkSize(65536)
-
-	// S->C result
-	msg, err = mr.Read()
-	require.NoError(t, err)
-	require.Equal(t, uint8(3), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err := flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"_result",
-		float64(1),
-		flvio.AMFMap{
-			{K: "fmsVer", V: "LNX 9,0,124,2"},
-			{K: "capabilities", V: float64(31)},
+		Name:          "connect",
+		CommandID:     1,
+		Arguments: []interface{}{
+			flvio.AMFMap{
+				{K: "app", V: "/stream"},
+				{K: "flashVer", V: "LNX 9,0,124,2"},
+				{K: "tcUrl", V: "rtmp://127.0.0.1:9121/stream"},
+				{K: "fpad", V: false},
+				{K: "capabilities", V: 15},
+				{K: "audioCodecs", V: 4071},
+				{K: "videoCodecs", V: 252},
+				{K: "videoFunction", V: 1},
+			},
 		},
-		flvio.AMFMap{
-			{K: "level", V: "status"},
-			{K: "code", V: "NetConnection.Connect.Success"},
-			{K: "description", V: "Connection succeeded."},
-			{K: "objectEncoding", V: float64(0)},
-		},
-	}, arr)
-
-	// C->S window acknowledgement size
-	err = mw.Write(&base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeSetWindowAckSize,
-		Body:          []byte{0x00, 0x26, 0x25, 0xa0},
 	})
 	require.NoError(t, err)
 
-	// C->S set chunk size
-	err = mw.Write(&base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeSetChunkSize,
-		Body:          []byte{0x00, 0x01, 0x00, 0x00},
-	})
+	msg, err := mrw.Read()
 	require.NoError(t, err)
+	require.Equal(t, &message.MsgSetWindowAckSize{
+		Value: 2500000,
+	}, msg)
 
-	mw.SetChunkSize(65536)
+	msg, err = mrw.Read()
+	require.NoError(t, err)
+	require.Equal(t, &message.MsgSetPeerBandwidth{
+		Value: 2500000,
+		Type:  2,
+	}, msg)
 
-	// C->S createStream
-	err = mw.Write(&base.Message{
+	msg, err = mrw.Read()
+	require.NoError(t, err)
+	require.Equal(t, &message.MsgSetChunkSize{
+		Value: 65536,
+	}, msg)
+
+	msg, err = mrw.Read()
+	require.NoError(t, err)
+	require.Equal(t, &message.MsgCommandAMF0{
 		ChunkStreamID: 3,
-		Type:          base.MessageTypeCommandAMF0,
-		Body: flvio.FillAMF0ValsMalloc([]interface{}{
-			"createStream",
-			float64(2),
+		Name:          "_result",
+		CommandID:     1,
+		Arguments: []interface{}{
+			flvio.AMFMap{
+				{K: "fmsVer", V: "LNX 9,0,124,2"},
+				{K: "capabilities", V: float64(31)},
+			},
+			flvio.AMFMap{
+				{K: "level", V: "status"},
+				{K: "code", V: "NetConnection.Connect.Success"},
+				{K: "description", V: "Connection succeeded."},
+				{K: "objectEncoding", V: float64(0)},
+			},
+		},
+	}, msg)
+
+	err = mrw.Write(&message.MsgSetWindowAckSize{
+		Value: 2500000,
+	})
+	require.NoError(t, err)
+
+	err = mrw.Write(&message.MsgSetChunkSize{
+		Value: 65536,
+	})
+	require.NoError(t, err)
+
+	err = mrw.Write(&message.MsgCommandAMF0{
+		ChunkStreamID: 3,
+		Name:          "createStream",
+		CommandID:     2,
+		Arguments: []interface{}{
 			nil,
-		}),
+		},
 	})
 	require.NoError(t, err)
 
-	// S->C result
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(3), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"_result",
-		float64(2),
-		nil,
-		float64(1),
-	}, arr)
-
-	// C->S getStreamLength
-	byts = flvio.FillAMF0ValsMalloc([]interface{}{
-		"getStreamLength",
-		float64(3),
-		nil,
-		"",
-	})
-	err = mw.Write(&base.Message{
-		ChunkStreamID: 8,
-		Body:          byts,
-	})
-	require.NoError(t, err)
-
-	// C->S play
-	byts = flvio.FillAMF0ValsMalloc([]interface{}{
-		"play",
-		float64(4),
-		nil,
-		"",
-		float64(-2000),
-	})
-	err = mw.Write(&base.Message{
-		ChunkStreamID: 8,
-		Type:          base.MessageTypeCommandAMF0,
-		Body:          byts,
-	})
-	require.NoError(t, err)
-
-	// S->C event "stream is recorded"
-	msg, err = mr.Read()
-	require.NoError(t, err)
-	require.Equal(t, &base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeUserControl,
-		Body:          []byte{0x00, 0x04, 0x00, 0x00, 0x00, 0x01},
+	require.Equal(t, &message.MsgCommandAMF0{
+		ChunkStreamID: 3,
+		Name:          "_result",
+		CommandID:     2,
+		Arguments: []interface{}{
+			nil,
+			float64(1),
+		},
 	}, msg)
 
-	// S->C event "stream begin 1"
-	msg, err = mr.Read()
+	err = mrw.Write(&message.MsgCommandAMF0{
+		ChunkStreamID: 8,
+		Name:          "getStreamLength",
+		CommandID:     3,
+		Arguments: []interface{}{
+			nil,
+			"",
+		},
+	})
 	require.NoError(t, err)
-	require.Equal(t, &base.Message{
-		ChunkStreamID: base.ControlChunkStreamID,
-		Type:          base.MessageTypeUserControl,
-		Body:          []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+
+	err = mrw.Write(&message.MsgCommandAMF0{
+		ChunkStreamID:   8,
+		MessageStreamID: 0x1000000,
+		Name:            "play",
+		CommandID:       4,
+		Arguments: []interface{}{
+			nil,
+			"",
+			float64(-2000),
+		},
+	})
+	require.NoError(t, err)
+
+	msg, err = mrw.Read()
+	require.NoError(t, err)
+	require.Equal(t, &message.MsgUserControlStreamIsRecorded{
+		StreamID: 1,
 	}, msg)
 
-	// S->C onStatus
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(5), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
+	require.Equal(t, &message.MsgUserControlStreamBegin{
+		StreamID: 1,
+	}, msg)
+
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"onStatus",
-		float64(4),
-		nil,
-		flvio.AMFMap{
-			{K: "level", V: "status"},
-			{K: "code", V: "NetStream.Play.Reset"},
-			{K: "description", V: "play reset"},
+	require.Equal(t, &message.MsgCommandAMF0{
+		ChunkStreamID:   5,
+		MessageStreamID: 0x1000000,
+		Name:            "onStatus",
+		CommandID:       4,
+		Arguments: []interface{}{
+			nil,
+			flvio.AMFMap{
+				{K: "level", V: "status"},
+				{K: "code", V: "NetStream.Play.Reset"},
+				{K: "description", V: "play reset"},
+			},
 		},
-	}, arr)
+	}, msg)
 
-	// S->C onStatus
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(5), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"onStatus",
-		float64(4),
-		nil,
-		flvio.AMFMap{
-			{K: "level", V: "status"},
-			{K: "code", V: "NetStream.Play.Start"},
-			{K: "description", V: "play start"},
+	require.Equal(t, &message.MsgCommandAMF0{
+		ChunkStreamID:   5,
+		MessageStreamID: 0x1000000,
+		Name:            "onStatus",
+		CommandID:       4,
+		Arguments: []interface{}{
+			nil,
+			flvio.AMFMap{
+				{K: "level", V: "status"},
+				{K: "code", V: "NetStream.Play.Start"},
+				{K: "description", V: "play start"},
+			},
 		},
-	}, arr)
+	}, msg)
 
-	// S->C onStatus
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(5), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"onStatus",
-		float64(4),
-		nil,
-		flvio.AMFMap{
-			{K: "level", V: "status"},
-			{K: "code", V: "NetStream.Data.Start"},
-			{K: "description", V: "data start"},
+	require.Equal(t, &message.MsgCommandAMF0{
+		ChunkStreamID:   5,
+		MessageStreamID: 0x1000000,
+		Name:            "onStatus",
+		CommandID:       4,
+		Arguments: []interface{}{
+			nil,
+			flvio.AMFMap{
+				{K: "level", V: "status"},
+				{K: "code", V: "NetStream.Data.Start"},
+				{K: "description", V: "data start"},
+			},
 		},
-	}, arr)
+	}, msg)
 
-	// S->C onStatus
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(5), msg.ChunkStreamID)
-	require.Equal(t, base.MessageTypeCommandAMF0, msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"onStatus",
-		float64(4),
-		nil,
-		flvio.AMFMap{
-			{K: "level", V: "status"},
-			{K: "code", V: "NetStream.Play.PublishNotify"},
-			{K: "description", V: "publish notify"},
+	require.Equal(t, &message.MsgCommandAMF0{
+		ChunkStreamID:   5,
+		MessageStreamID: 0x1000000,
+		Name:            "onStatus",
+		CommandID:       4,
+		Arguments: []interface{}{
+			nil,
+			flvio.AMFMap{
+				{K: "level", V: "status"},
+				{K: "code", V: "NetStream.Play.PublishNotify"},
+				{K: "description", V: "publish notify"},
+			},
 		},
-	}, arr)
+	}, msg)
 
-	// S->C onMetadata
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(4), msg.ChunkStreamID)
-	require.Equal(t, base.MessageType(0x12), msg.Type)
-	arr, err = flvio.ParseAMFVals(msg.Body, false)
-	require.NoError(t, err)
-	require.Equal(t, []interface{}{
-		"onMetaData",
-		flvio.AMFMap{
-			{K: "videodatarate", V: float64(0)},
-			{K: "videocodecid", V: float64(7)},
-			{K: "audiodatarate", V: float64(0)},
-			{K: "audiocodecid", V: float64(10)},
+	require.Equal(t, &message.MsgDataAMF0{
+		ChunkStreamID:   4,
+		MessageStreamID: 0x1000000,
+		Payload: []interface{}{
+			"@setDataFrame",
+			"onMetaData",
+			flvio.AMFMap{
+				{K: "videodatarate", V: float64(0)},
+				{K: "videocodecid", V: float64(7)},
+				{K: "audiodatarate", V: float64(0)},
+				{K: "audiocodecid", V: float64(10)},
+			},
 		},
-	}, arr)
+	}, msg)
 
-	// S->C H264 decoder config
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(6), msg.ChunkStreamID)
-	require.Equal(t, base.MessageType(0x09), msg.Type)
-	require.Equal(t, []byte{
-		0x17, 0x0, 0x0, 0x0, 0x0, 0x1, 0x64, 0x0,
-		0xc, 0xff, 0xe1, 0x0, 0x15, 0x67, 0x64, 0x0,
-		0xc, 0xac, 0x3b, 0x50, 0xb0, 0x4b, 0x42, 0x0,
-		0x0, 0x3, 0x0, 0x2, 0x0, 0x0, 0x3, 0x0,
-		0x3d, 0x8, 0x1, 0x0, 0x4, 0x68, 0xee, 0x3c,
-		0x80,
-	}, msg.Body)
+	require.Equal(t, &message.MsgVideo{
+		ChunkStreamID:   message.MsgVideoChunkStreamID,
+		MessageStreamID: 0x1000000,
+		IsKeyFrame:      true,
+		H264Type:        flvio.AVC_SEQHDR,
+		Payload: []byte{
+			0x1, 0x64, 0x0,
+			0xc, 0xff, 0xe1, 0x0, 0x15, 0x67, 0x64, 0x0,
+			0xc, 0xac, 0x3b, 0x50, 0xb0, 0x4b, 0x42, 0x0,
+			0x0, 0x3, 0x0, 0x2, 0x0, 0x0, 0x3, 0x0,
+			0x3d, 0x8, 0x1, 0x0, 0x4, 0x68, 0xee, 0x3c,
+			0x80,
+		},
+	}, msg)
 
-	// S->C AAC decoder config
-	msg, err = mr.Read()
+	msg, err = mrw.Read()
 	require.NoError(t, err)
-	require.Equal(t, uint8(4), msg.ChunkStreamID)
-	require.Equal(t, base.MessageType(0x08), msg.Type)
-	require.Equal(t, []byte{0xae, 0x0, 0x12, 0x10}, msg.Body)
+	require.Equal(t, &message.MsgAudio{
+		ChunkStreamID:   message.MsgAudioChunkStreamID,
+		MessageStreamID: 0x1000000,
+		Rate:            flvio.SOUND_44Khz,
+		Depth:           flvio.SOUND_16BIT,
+		Channels:        flvio.SOUND_STEREO,
+		AACType:         flvio.AAC_SEQHDR,
+		Payload:         []byte{0x12, 0x10},
+	}, msg)
+}
+
+func BenchmarkRead(b *testing.B) {
+	var buf bytes.Buffer
+
+	for n := 0; n < b.N; n++ {
+		buf.Write([]byte{
+			7, 0, 0, 23, 0, 0, 98, 8,
+			0, 0, 0, 64, 175, 1, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4, 1, 2,
+			3, 4, 1, 2, 3, 4,
+		})
+	}
+
+	conn := NewConn(&buf)
+
+	for n := 0; n < b.N; n++ {
+		conn.ReadMessage()
+	}
 }

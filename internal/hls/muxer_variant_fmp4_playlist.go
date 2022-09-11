@@ -71,7 +71,7 @@ type muxerVariantFMP4Playlist struct {
 	lowLatency   bool
 	segmentCount int
 	videoTrack   *gortsplib.TrackH264
-	audioTrack   *gortsplib.TrackAAC
+	audioTrack   *gortsplib.TrackMPEG4Audio
 
 	mutex              sync.Mutex
 	cond               *sync.Cond
@@ -90,7 +90,7 @@ func newMuxerVariantFMP4Playlist(
 	lowLatency bool,
 	segmentCount int,
 	videoTrack *gortsplib.TrackH264,
-	audioTrack *gortsplib.TrackAAC,
+	audioTrack *gortsplib.TrackMPEG4Audio,
 ) *muxerVariantFMP4Playlist {
 	p := &muxerVariantFMP4Playlist{
 		lowLatency:     lowLatency,
@@ -333,7 +333,7 @@ func (p *muxerVariantFMP4Playlist) fullPlaylist(isDeltaUpdate bool) io.Reader {
 			}
 
 			cnt += "#EXTINF:" + strconv.FormatFloat(seg.renderedDuration.Seconds(), 'f', 5, 64) + ",\n" +
-				seg.name() + ".mp4\n"
+				seg.name + ".mp4\n"
 
 		case *muxerVariantFMP4Gap:
 			cnt += "#EXT-X-GAP\n" +
@@ -440,16 +440,16 @@ func (p *muxerVariantFMP4Playlist) onSegmentFinalized(segment *muxerVariantFMP4S
 		p.mutex.Lock()
 		defer p.mutex.Unlock()
 
-		// create initial gap
+		// add initial gaps, required by iOS LL-HLS
 		if p.lowLatency && len(p.segments) == 0 {
-			for i := 0; i < p.segmentCount; i++ {
+			for i := 0; i < 7; i++ {
 				p.segments = append(p.segments, &muxerVariantFMP4Gap{
 					renderedDuration: segment.renderedDuration,
 				})
 			}
 		}
 
-		p.segmentsByName[segment.name()] = segment
+		p.segmentsByName[segment.name] = segment
 		p.segments = append(p.segments, segment)
 		p.nextSegmentID = segment.id + 1
 		p.nextSegmentParts = p.nextSegmentParts[:0]
@@ -463,7 +463,7 @@ func (p *muxerVariantFMP4Playlist) onSegmentFinalized(segment *muxerVariantFMP4S
 				}
 				p.parts = p.parts[len(toDeleteSeg.parts):]
 
-				delete(p.segmentsByName, toDeleteSeg.name())
+				delete(p.segmentsByName, toDeleteSeg.name)
 			}
 
 			p.segments = p.segments[1:]

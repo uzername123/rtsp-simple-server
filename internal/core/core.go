@@ -35,12 +35,13 @@ type Core struct {
 	rtspServer      *rtspServer
 	rtspsServer     *rtspServer
 	rtmpServer      *rtmpServer
+	rtmpsServer     *rtmpServer
 	hlsServer       *hlsServer
 	api             *api
 	confWatcher     *confwatcher.ConfWatcher
 
 	// in
-	apiConfigSet chan *conf.Conf
+	chAPIConfigSet chan *conf.Conf
 
 	// out
 	done chan struct{}
@@ -72,11 +73,11 @@ func New(args []string) (*Core, bool) {
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	p := &Core{
-		ctx:          ctx,
-		ctxCancel:    ctxCancel,
-		confPath:     *argConfPath,
-		apiConfigSet: make(chan *conf.Conf),
-		done:         make(chan struct{}),
+		ctx:            ctx,
+		ctxCancel:      ctxCancel,
+		confPath:       *argConfPath,
+		chAPIConfigSet: make(chan *conf.Conf),
+		done:           make(chan struct{}),
 	}
 
 	var err error
@@ -148,7 +149,7 @@ outer:
 				break outer
 			}
 
-		case newConf := <-p.apiConfigSet:
+		case newConf := <-p.chAPIConfigSet:
 			p.Log(logger.Info, "reloading configuration (API request)")
 
 			err := p.reloadConf(newConf, true)
@@ -304,7 +305,9 @@ func (p *Core) createResources(initial bool) error {
 		}
 	}
 
-	if !p.conf.RTMPDisable {
+	if !p.conf.RTMPDisable &&
+		(p.conf.RTMPEncryption == conf.EncryptionNo ||
+			p.conf.RTMPEncryption == conf.EncryptionOptional) {
 		if p.rtmpServer == nil {
 			p.rtmpServer, err = newRTMPServer(
 				p.ctx,
@@ -313,6 +316,36 @@ func (p *Core) createResources(initial bool) error {
 				p.conf.ReadTimeout,
 				p.conf.WriteTimeout,
 				p.conf.ReadBufferCount,
+				false,
+				"",
+				"",
+				p.conf.RTSPAddress,
+				p.conf.RunOnConnect,
+				p.conf.RunOnConnectRestart,
+				p.externalCmdPool,
+				p.metrics,
+				p.pathManager,
+				p)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if !p.conf.RTMPDisable &&
+		(p.conf.RTMPEncryption == conf.EncryptionStrict ||
+			p.conf.RTMPEncryption == conf.EncryptionOptional) {
+		if p.rtmpsServer == nil {
+			p.rtmpsServer, err = newRTMPServer(
+				p.ctx,
+				p.conf.ExternalAuthenticationURL,
+				p.conf.RTMPSAddress,
+				p.conf.ReadTimeout,
+				p.conf.WriteTimeout,
+				p.conf.ReadBufferCount,
+				true,
+				p.conf.RTMPServerCert,
+				p.conf.RTMPServerKey,
 				p.conf.RTSPAddress,
 				p.conf.RunOnConnect,
 				p.conf.RunOnConnectRestart,
@@ -342,6 +375,7 @@ func (p *Core) createResources(initial bool) error {
 				p.conf.HLSEncryption,
 				p.conf.HLSServerKey,
 				p.conf.HLSServerCert,
+				p.conf.HLSTrustedProxies,
 				p.conf.ReadBufferCount,
 				p.pathManager,
 				p.metrics,
@@ -361,6 +395,7 @@ func (p *Core) createResources(initial bool) error {
 				p.rtspServer,
 				p.rtspsServer,
 				p.rtmpServer,
+				p.rtmpsServer,
 				p.hlsServer,
 				p)
 			if err != nil {
@@ -410,7 +445,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		closeMetrics {
 		closePathManager = true
 	} else if !reflect.DeepEqual(newConf.Paths, p.conf.Paths) {
-		p.pathManager.onConfReload(newConf.Paths)
+		p.pathManager.confReload(newConf.Paths)
 	}
 
 	closeRTSPServer := false
@@ -462,6 +497,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	closeRTMPServer := false
 	if newConf == nil ||
 		newConf.RTMPDisable != p.conf.RTMPDisable ||
+		newConf.RTMPEncryption != p.conf.RTMPEncryption ||
 		newConf.RTMPAddress != p.conf.RTMPAddress ||
 		newConf.ExternalAuthenticationURL != p.conf.ExternalAuthenticationURL ||
 		newConf.ReadTimeout != p.conf.ReadTimeout ||
@@ -473,6 +509,25 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		closeMetrics ||
 		closePathManager {
 		closeRTMPServer = true
+	}
+
+	closeRTMPSServer := false
+	if newConf == nil ||
+		newConf.RTMPDisable != p.conf.RTMPDisable ||
+		newConf.RTMPEncryption != p.conf.RTMPEncryption ||
+		newConf.RTMPSAddress != p.conf.RTMPSAddress ||
+		newConf.ExternalAuthenticationURL != p.conf.ExternalAuthenticationURL ||
+		newConf.ReadTimeout != p.conf.ReadTimeout ||
+		newConf.WriteTimeout != p.conf.WriteTimeout ||
+		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
+		newConf.RTMPServerCert != p.conf.RTMPServerCert ||
+		newConf.RTMPServerKey != p.conf.RTMPServerKey ||
+		newConf.RTSPAddress != p.conf.RTSPAddress ||
+		newConf.RunOnConnect != p.conf.RunOnConnect ||
+		newConf.RunOnConnectRestart != p.conf.RunOnConnectRestart ||
+		closeMetrics ||
+		closePathManager {
+		closeRTMPSServer = true
 	}
 
 	closeHLSServer := false
@@ -490,6 +545,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.HLSEncryption != p.conf.HLSEncryption ||
 		newConf.HLSServerKey != p.conf.HLSServerKey ||
 		newConf.HLSServerCert != p.conf.HLSServerCert ||
+		!reflect.DeepEqual(newConf.HLSTrustedProxies, p.conf.HLSTrustedProxies) ||
 		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
 		closePathManager ||
 		closeMetrics {
@@ -518,7 +574,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 			p.api.close()
 			p.api = nil
 		} else if !calledByAPI { // avoid a loop
-			p.api.onConfReload(newConf)
+			p.api.confReload(newConf)
 		}
 	}
 
@@ -540,6 +596,11 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if closeHLSServer && p.hlsServer != nil {
 		p.hlsServer.close()
 		p.hlsServer = nil
+	}
+
+	if closeRTMPSServer && p.rtmpsServer != nil {
+		p.rtmpsServer.close()
+		p.rtmpsServer = nil
 	}
 
 	if closeRTMPServer && p.rtmpServer != nil {
@@ -575,10 +636,10 @@ func (p *Core) reloadConf(newConf *conf.Conf, calledByAPI bool) error {
 	return p.createResources(false)
 }
 
-// onAPIConfigSet is called by api.
-func (p *Core) onAPIConfigSet(conf *conf.Conf) {
+// apiConfigSet is called by api.
+func (p *Core) apiConfigSet(conf *conf.Conf) {
 	select {
-	case p.apiConfigSet <- conf:
+	case p.chAPIConfigSet <- conf:
 	case <-p.ctx.Done():
 	}
 }

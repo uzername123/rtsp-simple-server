@@ -42,7 +42,7 @@ func newPPROF(
 
 	pp.log(logger.Info, "listener opened on "+address)
 
-	go pp.run()
+	go pp.server.Serve(pp.ln)
 
 	return pp, nil
 }
@@ -50,15 +50,9 @@ func newPPROF(
 func (pp *pprof) close() {
 	pp.log(logger.Info, "listener is closing")
 	pp.server.Shutdown(context.Background())
+	pp.ln.Close() // in case Shutdown() is called before Serve()
 }
 
 func (pp *pprof) log(level logger.Level, format string, args ...interface{}) {
 	pp.parent.Log(level, "[pprof] "+format, args...)
-}
-
-func (pp *pprof) run() {
-	err := pp.server.Serve(pp.ln)
-	if err != http.ErrServerClosed {
-		panic(err)
-	}
 }

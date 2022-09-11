@@ -200,8 +200,12 @@ type Conf struct {
 	AuthMethods       AuthMethods `json:"authMethods"`
 
 	// RTMP
-	RTMPDisable bool   `json:"rtmpDisable"`
-	RTMPAddress string `json:"rtmpAddress"`
+	RTMPDisable    bool       `json:"rtmpDisable"`
+	RTMPAddress    string     `json:"rtmpAddress"`
+	RTMPEncryption Encryption `json:"rtmpEncryption"`
+	RTMPSAddress   string     `json:"rtmpsAddress"`
+	RTMPServerKey  string     `json:"rtmpServerKey"`
+	RTMPServerCert string     `json:"rtmpServerCert"`
 
 	// HLS
 	HLSDisable         bool           `json:"hlsDisable"`
@@ -216,6 +220,7 @@ type Conf struct {
 	HLSEncryption      bool           `json:"hlsEncryption"`
 	HLSServerKey       string         `json:"hlsServerKey"`
 	HLSServerCert      string         `json:"hlsServerCert"`
+	HLSTrustedProxies  IPsOrCIDRs     `json:"hlsTrustedProxies"`
 
 	// paths
 	Paths map[string]*PathConf `json:"paths"`
@@ -267,6 +272,9 @@ func (conf *Conf) CheckAndFillMissing() error {
 
 	if conf.ReadBufferCount == 0 {
 		conf.ReadBufferCount = 512
+	}
+	if (conf.ReadBufferCount & (conf.ReadBufferCount - 1)) != 0 {
+		return fmt.Errorf("'ReadBufferCount' must be a power of two")
 	}
 
 	if conf.ExternalAuthenticationURL != "" {
@@ -348,6 +356,10 @@ func (conf *Conf) CheckAndFillMissing() error {
 
 	if conf.RTMPAddress == "" {
 		conf.RTMPAddress = ":1935"
+	}
+
+	if conf.RTMPSAddress == "" {
+		conf.RTMPSAddress = ":1936"
 	}
 
 	if conf.HLSAddress == "" {

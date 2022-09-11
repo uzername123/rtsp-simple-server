@@ -3,11 +3,12 @@ package core
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/aler9/rtsp-simple-server/internal/conf"
 	"github.com/aler9/rtsp-simple-server/internal/externalcmd"
@@ -15,8 +16,9 @@ import (
 )
 
 type rtmpServerAPIConnsListItem struct {
-	RemoteAddr string `json:"remoteAddr"`
-	State      string `json:"state"`
+	Created    time.Time `json:"created"`
+	RemoteAddr string    `json:"remoteAddr"`
+	State      string    `json:"state"`
 }
 
 type rtmpServerAPIConnsListData struct {
@@ -50,6 +52,7 @@ type rtmpServer struct {
 	readTimeout               conf.StringDuration
 	writeTimeout              conf.StringDuration
 	readBufferCount           int
+	isTLS                     bool
 	rtspAddress               string
 	runOnConnect              string
 	runOnConnectRestart       bool
@@ -61,13 +64,13 @@ type rtmpServer struct {
 	ctx       context.Context
 	ctxCancel func()
 	wg        sync.WaitGroup
-	l         net.Listener
+	ln        net.Listener
 	conns     map[*rtmpConn]struct{}
 
 	// in
-	connClose    chan *rtmpConn
-	apiConnsList chan rtmpServerAPIConnsListReq
-	apiConnsKick chan rtmpServerAPIConnsKickReq
+	chConnClose    chan *rtmpConn
+	chAPIConnsList chan rtmpServerAPIConnsListReq
+	chAPIConnsKick chan rtmpServerAPIConnsKickReq
 }
 
 func newRTMPServer(
@@ -77,6 +80,9 @@ func newRTMPServer(
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
 	readBufferCount int,
+	isTLS bool,
+	serverCert string,
+	serverKey string,
 	rtspAddress string,
 	runOnConnect string,
 	runOnConnectRestart bool,
@@ -85,7 +91,18 @@ func newRTMPServer(
 	pathManager *pathManager,
 	parent rtmpServerParent,
 ) (*rtmpServer, error) {
-	l, err := net.Listen("tcp", address)
+	ln, err := func() (net.Listener, error) {
+		if !isTLS {
+			return net.Listen("tcp", address)
+		}
+
+		cert, err := tls.LoadX509KeyPair(serverCert, serverKey)
+		if err != nil {
+			return nil, err
+		}
+
+		return tls.Listen("tcp", address, &tls.Config{Certificates: []tls.Certificate{cert}})
+	}()
 	if err != nil {
 		return nil, err
 	}
@@ -100,23 +117,24 @@ func newRTMPServer(
 		rtspAddress:               rtspAddress,
 		runOnConnect:              runOnConnect,
 		runOnConnectRestart:       runOnConnectRestart,
+		isTLS:                     isTLS,
 		externalCmdPool:           externalCmdPool,
 		metrics:                   metrics,
 		pathManager:               pathManager,
 		parent:                    parent,
 		ctx:                       ctx,
 		ctxCancel:                 ctxCancel,
-		l:                         l,
+		ln:                        ln,
 		conns:                     make(map[*rtmpConn]struct{}),
-		connClose:                 make(chan *rtmpConn),
-		apiConnsList:              make(chan rtmpServerAPIConnsListReq),
-		apiConnsKick:              make(chan rtmpServerAPIConnsKickReq),
+		chConnClose:               make(chan *rtmpConn),
+		chAPIConnsList:            make(chan rtmpServerAPIConnsListReq),
+		chAPIConnsKick:            make(chan rtmpServerAPIConnsKickReq),
 	}
 
 	s.log(logger.Info, "listener opened on %s", address)
 
 	if s.metrics != nil {
-		s.metrics.onRTMPServerSet(s)
+		s.metrics.rtmpServerSet(s)
 	}
 
 	s.wg.Add(1)
@@ -126,7 +144,13 @@ func newRTMPServer(
 }
 
 func (s *rtmpServer) log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[RTMP] "+format, append([]interface{}{}, args...)...)
+	label := func() string {
+		if s.isTLS {
+			return "RTMPS"
+		}
+		return "RTMP"
+	}()
+	s.parent.Log(level, "[%s] "+format, append([]interface{}{label}, args...)...)
 }
 
 func (s *rtmpServer) close() {
@@ -145,7 +169,7 @@ func (s *rtmpServer) run() {
 		defer s.wg.Done()
 		err := func() error {
 			for {
-				conn, err := s.l.Accept()
+				conn, err := s.ln.Accept()
 				if err != nil {
 					return err
 				}
@@ -176,6 +200,7 @@ outer:
 
 			c := newRTMPConn(
 				s.ctx,
+				s.isTLS,
 				id,
 				s.externalAuthenticationURL,
 				s.rtspAddress,
@@ -191,20 +216,21 @@ outer:
 				s)
 			s.conns[c] = struct{}{}
 
-		case c := <-s.connClose:
+		case c := <-s.chConnClose:
 			if _, ok := s.conns[c]; !ok {
 				continue
 			}
 			delete(s.conns, c)
 
-		case req := <-s.apiConnsList:
+		case req := <-s.chAPIConnsList:
 			data := &rtmpServerAPIConnsListData{
 				Items: make(map[string]rtmpServerAPIConnsListItem),
 			}
 
 			for c := range s.conns {
-				data.Items[c.ID()] = rtmpServerAPIConnsListItem{
-					RemoteAddr: c.RemoteAddr().String(),
+				data.Items[c.id] = rtmpServerAPIConnsListItem{
+					Created:    c.created,
+					RemoteAddr: c.remoteAddr().String(),
 					State: func() string {
 						switch c.safeState() {
 						case rtmpConnStateRead:
@@ -220,10 +246,10 @@ outer:
 
 			req.res <- rtmpServerAPIConnsListRes{data: data}
 
-		case req := <-s.apiConnsKick:
+		case req := <-s.chAPIConnsKick:
 			res := func() bool {
 				for c := range s.conns {
-					if c.ID() == req.id {
+					if c.id == req.id {
 						delete(s.conns, c)
 						c.close()
 						return true
@@ -244,10 +270,10 @@ outer:
 
 	s.ctxCancel()
 
-	s.l.Close()
+	s.ln.Close()
 
 	if s.metrics != nil {
-		s.metrics.onRTMPServerSet(s)
+		s.metrics.rtmpServerSet(s)
 	}
 }
 
@@ -259,7 +285,7 @@ func (s *rtmpServer) newConnID() (string, error) {
 			return "", err
 		}
 
-		u := binary.LittleEndian.Uint32(b)
+		u := uint32(b[3])<<24 | uint32(b[2])<<16 | uint32(b[1])<<8 | uint32(b[0])
 		u %= 899999999
 		u += 100000000
 
@@ -267,7 +293,7 @@ func (s *rtmpServer) newConnID() (string, error) {
 
 		alreadyPresent := func() bool {
 			for c := range s.conns {
-				if c.ID() == id {
+				if c.id == id {
 					return true
 				}
 			}
@@ -279,19 +305,19 @@ func (s *rtmpServer) newConnID() (string, error) {
 	}
 }
 
-// onConnClose is called by rtmpConn.
-func (s *rtmpServer) onConnClose(c *rtmpConn) {
+// connClose is called by rtmpConn.
+func (s *rtmpServer) connClose(c *rtmpConn) {
 	select {
-	case s.connClose <- c:
+	case s.chConnClose <- c:
 	case <-s.ctx.Done():
 	}
 }
 
-// onAPIConnsList is called by api.
-func (s *rtmpServer) onAPIConnsList(req rtmpServerAPIConnsListReq) rtmpServerAPIConnsListRes {
+// apiConnsList is called by api.
+func (s *rtmpServer) apiConnsList(req rtmpServerAPIConnsListReq) rtmpServerAPIConnsListRes {
 	req.res = make(chan rtmpServerAPIConnsListRes)
 	select {
-	case s.apiConnsList <- req:
+	case s.chAPIConnsList <- req:
 		return <-req.res
 
 	case <-s.ctx.Done():
@@ -299,11 +325,11 @@ func (s *rtmpServer) onAPIConnsList(req rtmpServerAPIConnsListReq) rtmpServerAPI
 	}
 }
 
-// onAPIConnsKick is called by api.
-func (s *rtmpServer) onAPIConnsKick(req rtmpServerAPIConnsKickReq) rtmpServerAPIConnsKickRes {
+// apiConnsKick is called by api.
+func (s *rtmpServer) apiConnsKick(req rtmpServerAPIConnsKickReq) rtmpServerAPIConnsKickRes {
 	req.res = make(chan rtmpServerAPIConnsKickRes)
 	select {
-	case s.apiConnsKick <- req:
+	case s.chAPIConnsKick <- req:
 		return <-req.res
 
 	case <-s.ctx.Done():
